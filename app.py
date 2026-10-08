@@ -4,7 +4,9 @@ Files land relative to the working directory (/music in the container),
 exactly like `spotdl web --web-use-output-dir`.
 """
 
+import base64
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -23,10 +25,22 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from mutagen import File as AudioFile
+from mutagen.flac import Picture
 from spotapi import Artist, PublicAlbum, PublicPlaylist, Song
 from spotapi.client import BaseClient
 from spotapi.exceptions import BaseClientError, RequestError
 from spotapi.http.request import TLSClient
+
+# spotdl's modules import each other, and loading them from two threads at once
+# deadlocks (it once killed the download worker at startup), so all of it loads
+# here, before any thread starts.
+from spotdl.download.downloader import Downloader
+from spotdl.types.song import Song as SpotdlSong
+from spotdl.utils.formatter import create_file_name, sanitize_string
+from spotdl.utils.metadata import get_file_metadata
+from spotdl.utils.search import parse_query
+from spotdl.utils.spotify import SpotifyClient
 
 SETTINGS = {
     "output": os.environ.get(
@@ -336,7 +350,14 @@ STATE = Path(".music-findr/jobs.json")  # inside /music; hidden, so the library 
 RUNNING = ("queued", "waiting", "resolving", "downloading")
 KEEP = 300  # finished downloads kept in the history
 jobs: list = []
-pending: queue.Queue = queue.Queue()
+pending: queue.PriorityQueue = queue.PriorityQueue()
+_order = itertools.count()
+
+
+def submit(job):
+    """Queue a job. Discographies can take hours, so songs, albums and playlists
+    you add go ahead of them; otherwise first come, first served."""
+    pending.put((job["kind"] == "artist", next(_order), job))
 lock = threading.Lock()
 _saving = threading.Lock()
 active: dict = {}  # {"job": job} while downloading, for the progress callback
@@ -387,7 +408,7 @@ def restore():
             if job["status"] in RUNNING:
                 drop_partial_files(job)
                 reset(job)
-                pending.put(job)
+                submit(job)
             kept.insert(0, job)
         except Exception:  # a damaged entry shouldn't stop the app starting
             log.exception("skipping a saved download I can't read: %s", job)
@@ -464,7 +485,7 @@ def queue_download(kind, id, title=None, subtitle=None, image=None):
         jobs.insert(0, job)
         for old in [j for j in jobs if j["status"] not in RUNNING][KEEP:]:
             jobs.remove(old)  # newest first, so these are the oldest finished ones
-    pending.put(job)
+    submit(job)
     save()
     return view(job)
 
@@ -496,7 +517,7 @@ def retry(job_id: str):
         if job["status"] in RUNNING:
             raise HTTPException(409, "That download is already queued")
         reset(job)
-    pending.put(job)
+    submit(job)
     save()
     return view(job)
 
@@ -523,8 +544,6 @@ def on_progress(tracker, message):
 
 def target(song):
     """Where spotdl will write a song, so a restart can clean up after it."""
-    from spotdl.utils.formatter import create_file_name
-
     try:
         return str(create_file_name(song, SETTINGS["output"], SETTINGS["format"]))
     except Exception:
@@ -685,19 +704,31 @@ def work(job, downloader, resolve, sleep=time.sleep):
         wait = min(wait * 2, 1800)
 
 
-def worker():
-    # Imported here so the API (and its tests) load without ffmpeg/YouTube setup.
-    from spotdl.download.downloader import Downloader
-    from spotdl.utils.search import parse_query
-    from spotdl.utils.spotify import SpotifyClient
+def serve_one(job, downloader, resolve):
+    """Run one job; whatever goes wrong, the worker carries on with the next."""
+    try:
+        work(job, downloader, resolve)
+    except Exception as exc:
+        log.exception("download %s crashed", job.get("job"))
+        job["status"], job["error"] = "failed", f"Crashed: {type(exc).__name__}: {exc}"
+        save()
 
-    SpotifyClient.init(client_id="", client_secret="", no_cache=True)
-    downloader = Downloader(SETTINGS)
+
+def worker():
+    while True:  # if setup fails (no ffmpeg, no network...), say why and try again
+        try:
+            if SpotifyClient._instance is None:
+                SpotifyClient.init(client_id="", client_secret="", no_cache=True)
+            downloader = Downloader(SETTINGS)
+            break
+        except Exception:
+            log.exception("the downloader couldn't start; trying again in a minute")
+            time.sleep(60)
     downloader.progress_handler.update_callback = on_progress
     resolve = lambda urls: spotify(lambda: parse_query(urls, threads=SETTINGS["threads"]))  # noqa: E731
     log.info("Saving to %s as %s", Path.cwd(), SETTINGS["output"])
     while True:
-        work(pending.get(), downloader, resolve)
+        serve_one(pending.get()[2], downloader, resolve)
 
 
 # --- Organize: move existing files to where OUTPUT says they belong ---------
@@ -708,9 +739,6 @@ _scanning = threading.Lock()  # one scan at a time; the next one reuses its cach
 
 
 def read_tags(path: Path):
-    from mutagen import File as AudioFile
-    from spotdl.utils.metadata import get_file_metadata
-
     try:
         meta = get_file_metadata(path) or {}
         length = AudioFile(path).info.length
@@ -751,9 +779,6 @@ def _scan(root: Path):
 def plan_library(root: Path):
     """Work out each file's OUTPUT path from its tags, using spotdl's own
     naming so a later download of the same song finds it and skips."""
-    from spotdl.types.song import Song
-    from spotdl.utils.formatter import create_file_name
-
     plan = {"moves": [], "conflicts": [], "untagged": [], "in_place": 0}
     claimed = set()
     for rel, meta in scan(root):
@@ -762,7 +787,7 @@ def plan_library(root: Path):
             continue
         fields = {**meta, "album_artist": meta.get("album_artist") or meta["artists"][0]}
         try:
-            target = create_file_name(Song.from_missing_data(**fields), SETTINGS["output"], rel.suffix[1:].lower())
+            target = create_file_name(SpotdlSong.from_missing_data(**fields), SETTINGS["output"], rel.suffix[1:].lower())
         except Exception:
             target = None
         # tags like ".." would point outside the folder; ".x"/"@x" would hide it from the library
@@ -887,11 +912,6 @@ def _int(value):
 @app.get("/api/library/cover")
 def library_cover(path: str):
     """The cover art embedded in a song file."""
-    import base64
-
-    from mutagen import File as AudioFile
-    from mutagen.flac import Picture
-
     root = Path.cwd().resolve()
     file = (root / path).resolve()
     if root not in file.parents or file.suffix.lower() not in AUDIO or not file.is_file():
@@ -942,8 +962,13 @@ def load_saved():
             p["owner"] = (p.get("owner") or "").removeprefix("By ") or None  # older versions kept "By "
         cut_off = [dict(p) for p in saved.values() if "Waiting for Jellyfin" in (p.get("jellyfin") or "")]
     busy = busy_ids()
-    for p in cut_off:  # a restart stopped its Jellyfin push; sync again (nothing re-downloads)
-        if p["id"] not in busy:
+    for p in cut_off:  # a restart stopped its Jellyfin push
+        with lock:
+            last = next((j for j in jobs if j["kind"] == "playlist" and j["id"] == p["id"]
+                         and j["status"] in ("done", "stopped") and j["songs"]), None)
+        if last:  # its songs are on disk already: just redo the Jellyfin part, now
+            publish(last)
+        elif p["id"] not in busy:
             queue_download("playlist", p["id"], p["name"], p["owner"] and f"By {p['owner']}", p["image"])
 
 
@@ -1024,8 +1049,6 @@ def publish(job, background=True):
 
 
 def write_m3u(name, songs):
-    from spotdl.utils.formatter import sanitize_string
-
     PLAYLIST_DIR.mkdir(exist_ok=True)
     path = PLAYLIST_DIR / f"{sanitize_string(name).lstrip('.') or 'Playlist'}.m3u8"
     lines = ["#EXTM3U", f"#PLAYLIST:{name}"]

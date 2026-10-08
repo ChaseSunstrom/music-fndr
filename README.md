@@ -49,6 +49,7 @@ All optional. Set them under `environment:`.
 - **Couldn't download:** each song that fails gets one automatic retry. **Retry** on a finished download runs it again, and only what's missing downloads.
 - **Restarts:** the queue is saved in `/music/.music-findr/`. After a restart or crash, anything that was waiting or running starts again, and songs that were cut off mid-write are cleaned up first.
 - **Stop** ends a running download after the songs in progress.
+- **Order:** songs, albums and playlists you add run before queued artist discographies, which can take hours.
 
 ## Your library
 

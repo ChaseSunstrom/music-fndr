@@ -17,6 +17,47 @@ client = TestClient(app.app)
 client.headers["X-Requested-With"] = "music-findr"  # what the UI sends on every change
 
 
+def check_spotdl_loads_before_threads():
+    """spotdl's modules import each other; loading them from two threads at once
+    deadlocks (it killed the download worker on startup). They must all load
+    when the app loads, before any thread starts."""
+    import subprocess
+    import sys
+
+    code = ("import sys, app; mods = ['spotdl.download.downloader', 'spotdl.utils.search', 'spotdl.utils.spotify', "
+            "'spotdl.utils.metadata', 'spotdl.utils.formatter', 'spotdl.types.song', 'mutagen.flac']; "
+            "missing = [m for m in mods if m not in sys.modules]; assert not missing, missing")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-500:]
+
+
+def check_worker_survives_a_crash():
+    job = client.post("/api/downloads", json={"kind": "track", "id": "boom"}).json()
+    raw = next(j for j in app.jobs if j["job"] == job["job"])
+    real_work = app.work
+    app.work = lambda *a, **k: 1 / 0
+    try:
+        app.serve_one(raw, None, None)  # must not raise: the worker thread lives on
+    finally:
+        app.work = real_work
+    assert raw["status"] == "failed" and "ZeroDivisionError" in raw["error"], raw
+    with app.lock:
+        app.jobs.remove(raw)
+
+
+def check_discographies_wait_their_turn():
+    """Songs, albums and playlists you add run before queued discographies (which
+    can take hours), in the order you added them."""
+    while not app.pending.empty():
+        app.pending.get_nowait()
+    for kind, sid_ in [("artist", "a1"), ("artist", "a2"), ("playlist", "p1"), ("album", "b1")]:
+        client.post("/api/downloads", json={"kind": kind, "id": sid_})
+    order = [app.pending.get_nowait()[2]["id"] for _ in range(4)]
+    assert order == ["p1", "b1", "a1", "a2"], order
+    with app.lock:
+        app.jobs.clear()
+
+
 def check_links():
     for q, want in [
         ("https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE?si=x", ("album", "6dVIqQ8qmQ5GBnJ9shOYGE")),
@@ -241,7 +282,7 @@ def check_restart():
     assert not cut.exists() and finished.exists() and older.exists()
     assert [j["job"] for j in app.jobs] == ["j1", "j0"], [j["job"] for j in app.jobs]
     assert (app.jobs[0]["status"], app.jobs[0]["songs"]) == ("queued", {})
-    assert app.pending.get_nowait() is app.jobs[0] and app.pending.empty()
+    assert app.pending.get_nowait()[2] is app.jobs[0] and app.pending.empty()
 
     assert client.post("/api/downloads/j0/retry").json()["status"] == "queued"
     assert client.post("/api/downloads/j1/retry").status_code == 409
@@ -425,12 +466,23 @@ def check_playlists():
                     "jellyfin": "Waiting for Jellyfin to pick up new songs…"},
             "ok": {"id": "ok", "name": "Fine", "owner": None, "image": None, "synced": 1, "songs": 2,
                    "jellyfin": "In Jellyfin: 2 of 2 songs"}}))
+        # "had": its last download is in the history, so it's re-published right
+        # away from there (no queue, no Spotify); "cut" has none, so it re-syncs
+        stored = json.loads(app.SAVED.read_text())
+        stored["had"] = {**stored["cut"], "id": "had", "name": "Had"}
+        app.SAVED.write_text(json.dumps(stored))
         with app.lock:
-            app.jobs.clear()
+            app.jobs[:] = [{"job": "old", "kind": "playlist", "id": "had", "status": "done", "title": "Had",
+                            "songs": {"u": {"status": "skipped", "path": "A/a.mp3"}}}]
         app.saved.clear()
-        app.load_saved()
-        assert app.saved["cut"]["owner"] == "Chase"
-        assert [(j["id"], j["subtitle"]) for j in app.jobs if j["kind"] == "playlist"] == [("cut", "By Chase")]
+        republished, real_publish = [], app.publish
+        app.publish = lambda job, background=True: republished.append(job["job"])
+        try:
+            app.load_saved()
+        finally:
+            app.publish = real_publish
+        assert app.saved["cut"]["owner"] == "Chase" and republished == ["old"], republished
+        assert [(j["id"], j["subtitle"]) for j in app.jobs if j["status"] == "queued"] == [("cut", "By Chase")]
 
         # a sync that fails (say the playlist was deleted on Spotify) waits a full
         # interval before trying again, rather than piling up a failed job every hour
@@ -527,6 +579,9 @@ def check_home():
 
 
 if __name__ == "__main__":
+    check_spotdl_loads_before_threads()
+    check_worker_survives_a_crash()
+    check_discographies_wait_their_turn()
     check_links()
     check_cross_site_guard()
     check_jobs()
