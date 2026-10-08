@@ -4,6 +4,7 @@ Files land relative to the working directory (/music in the container),
 exactly like `spotdl web --web-use-output-dir`.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,15 @@ LINK = re.compile(
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("music-findr")
 app = FastAPI(title="music-findr")
+
+
+@app.middleware("http")
+async def same_site_only(request: Request, call_next):
+    """Changes need a header other websites can't send without a CORS preflight
+    (which this app never grants), so a page you visit can't drive it."""
+    if request.method not in ("GET", "HEAD") and request.headers.get("x-requested-with") != "music-findr":
+        return JSONResponse({"detail": "Missing X-Requested-With: music-findr"}, status_code=403)
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)
@@ -240,6 +250,7 @@ HOME_PLAYLISTS = [
     "37i9dQZF1DX4sWSpwq3LiO",  # Peaceful Piano
 ]
 _home: dict = {"at": 0.0, "data": None}
+_home_lock = threading.Lock()
 
 
 def playlist_cover(playlist_id: str):
@@ -253,8 +264,19 @@ def playlist_cover(playlist_id: str):
 @app.get("/api/home")
 def home():
     """Charts, new releases and big playlists, cached for an hour."""
-    if _home["data"] and time.time() - _home["at"] < 3600:
-        return _home["data"]
+    with _home_lock:
+        if _home["data"] and time.time() - _home["at"] < 3600:
+            return _home["data"]
+        try:
+            return _build_home()
+        except Exception:
+            if _home["data"]:  # Spotify hiccup: last hour's page beats an error
+                log.exception("home refresh failed; serving the old one")
+                return _home["data"]
+            raise
+
+
+def _build_home():
     with ThreadPoolExecutor(6) as pool:
         chart = pool.submit(playlist, HOME_CHART)
         fresh = pool.submit(playlist, HOME_NEW)
@@ -320,14 +342,19 @@ def restore():
         saved = json.loads(STATE.read_text())
     except (OSError, ValueError):
         return
+    kept = []
     for job in reversed(saved):  # oldest first, the order they were added
-        if job["status"] in RUNNING:
-            drop_partial_files(job)
-            reset(job)
-            pending.put(job)
+        try:
+            if job["status"] in RUNNING:
+                drop_partial_files(job)
+                reset(job)
+                pending.put(job)
+            kept.insert(0, job)
+        except Exception:  # a damaged entry shouldn't stop the app starting
+            log.exception("skipping a saved download I can't read: %s", job)
     with lock:
-        jobs[:0] = saved
-    log.info("Restored %d downloads, %d to resume", len(saved), pending.qsize())
+        jobs[:0] = kept
+    log.info("Restored %d downloads, %d to resume", len(kept), pending.qsize())
 
 
 def drop_partial_files(job):
@@ -343,7 +370,10 @@ def drop_partial_files(job):
             and not read_tags(path).get("name")  # spotdl tags a file once it's complete
         ):
             log.info("Removing %s: the restart cut it off mid-download", path)
-            path.unlink()
+            try:
+                path.unlink()
+            except OSError:
+                log.exception("couldn't remove %s", path)
 
 
 def find(job_id: str):
@@ -593,6 +623,9 @@ def _scan(root: Path):
         if not cached or cached[0] != mtime:
             cached = _tags[path] = (mtime, read_tags(path))
         found.append((rel, cached[1]))
+    seen = {root / rel for rel, _ in found}
+    for gone in [p for p in _tags if p.is_relative_to(root) and p not in seen]:
+        del _tags[gone]  # moved or deleted since the last scan
     return found
 
 
@@ -609,25 +642,32 @@ def plan_library(root: Path):
             plan["untagged"].append(str(rel))
             continue
         fields = {**meta, "album_artist": meta.get("album_artist") or meta["artists"][0]}
-        song = Song.from_missing_data(**fields)
-        target = create_file_name(song, SETTINGS["output"], rel.suffix[1:].lower())
-        if target == rel:
+        try:
+            target = create_file_name(Song.from_missing_data(**fields), SETTINGS["output"], rel.suffix[1:].lower())
+        except Exception:
+            target = None
+        # tags like ".." would point outside the folder; ".x"/"@x" would hide it from the library
+        if not target or target.is_absolute() or any(p.startswith((".", "@")) for p in target.parts):
+            plan["untagged"].append(str(rel))
+        elif target == rel:
             plan["in_place"] += 1
         elif target in claimed or (root / target).exists():
             plan["conflicts"].append({"from": str(rel), "to": str(target)})
         else:
             claimed.add(target)
             plan["moves"].append({"from": str(rel), "to": str(target)})
+    # fingerprint of the exact moves, so "Move" only ever does what the preview showed
+    plan["plan"] = hashlib.sha1(json.dumps(plan["moves"]).encode()).hexdigest()[:16]
     return plan
 
 
 def move_files(root: Path, moves):
     """Move files (and same-name .lrc lyrics) without ever overwriting, then
     remove folders the moves left empty."""
-    moved, emptied = 0, set()
+    moved, emptied, inside = 0, set(), root.resolve()
     for m in moves:
         src, dst = root / m["from"], root / m["to"]
-        if dst.exists() or not src.exists():
+        if dst.exists() or not src.exists() or inside not in dst.resolve().parents:
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
@@ -647,18 +687,21 @@ def move_files(root: Path, moves):
 
 
 @app.post("/api/organize")
-def organize(apply: bool = False):
+def organize(apply: bool = False, plan: Optional[str] = None):
+    """Preview (default) or apply the moves; applying needs the preview's `plan`."""
     if not library.acquire(blocking=False):
         raise HTTPException(409, "Downloads are running; organize when they finish")
     try:
         root = Path.cwd()
-        plan = plan_library(root)
-        plan["moved"] = move_files(root, plan["moves"]) if apply else 0
+        found = plan_library(root)
+        if apply and plan != found["plan"]:
+            raise HTTPException(409, "Your folder changed since you checked it. Check again before moving.")
+        found["moved"] = move_files(root, found["moves"]) if apply else 0
     finally:
         library.release()
     return {
-        **{k: v[:300] if isinstance(v, list) else v for k, v in plan.items()},
-        "counts": {k: len(v) for k, v in plan.items() if isinstance(v, list)},
+        **{k: v[:300] if isinstance(v, list) else v for k, v in found.items()},
+        "counts": {k: len(v) for k, v in found.items() if isinstance(v, list)},
         "applied": apply,
     }
 
@@ -728,7 +771,12 @@ def library_cover(path: str):
     file = (root / path).resolve()
     if root not in file.parents or file.suffix.lower() not in AUDIO or not file.is_file():
         raise HTTPException(404, "No such song")
-    audio, data = AudioFile(file), None
+    try:
+        audio, data = AudioFile(file), None
+    except Exception:
+        audio = None
+    if audio is None:
+        raise HTTPException(404, "Not a readable song")
     if hasattr(audio, "pictures") and audio.pictures:  # flac
         data = audio.pictures[0].data
     elif audio.tags is not None:

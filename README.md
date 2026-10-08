@@ -38,9 +38,24 @@ All optional. Set them under `environment:`.
 | `THREADS` | `4` | How many songs download at the same time |
 | `PORT`    | `8800` | The port the web UI listens on |
 
-Songs that are already in the folder are skipped, so downloading an album twice is safe.
+## How downloads behave
 
-**Discography** downloads every album and single. Compilations are left out because they repeat songs you already have.
+- **Already have it:** songs already in the folder are skipped, so downloading an album twice is safe.
+- **Discography** downloads every album and single, one release at a time. Compilations are left out. When the same recording turns up on several releases (single and album, clean and explicit, deluxe), it's saved once.
+- **Couldn't download:** each song that fails gets one automatic retry. **Retry** on a finished download runs it again, and only what's missing downloads.
+- **Restarts:** the queue is saved in `/music/.music-findr/`. After a restart or crash, anything that was waiting or running starts again, and songs that were cut off mid-write are cleaned up first.
+- **Stop** ends a running download after the songs in progress.
+
+## Your library
+
+**Library** shows what's in your music folder by artist and album, read from the files' tags. Spotify pages mark songs you already have.
+
+- **Organize your music folder** moves existing files into the `OUTPUT` layout (Artist/Album folders by default) using their tags. It shows every move before doing anything, and **Move** applies exactly that preview. It never overwrites or deletes your files: files with missing tags, and files that would land on an existing file, stay where they are. Folders left empty are removed. Keep `FORMAT` the same as your existing files (spotDL's default is mp3) so they're recognised. Run this once if you're coming from spotDL's flat layout; otherwise songs you already have won't be recognised.
+- **Get missing songs**, on each artist or on every artist at once, finds the artist on Spotify and queues their discography. Songs you have come back as "Already there", so a finished download tells you what was missing.
+
+## Rate limits
+
+Spotify lookups use the same anonymous access as the Spotify web player, so there's no API key to get banned. Audio comes from YouTube, which can slow down or block heavy use. If many songs show "Couldn't download", lower `THREADS` and use **Retry** later.
 
 ## Updating
 

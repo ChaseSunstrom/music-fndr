@@ -308,8 +308,9 @@ const ICON = {
 };
 const SPIN = '<svg class="spin" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--amber)"/><circle cx="16" cy="16" r="9.5" fill="none" stroke="var(--amber-ink)" stroke-opacity=".3"/><circle cx="16" cy="16" r="4.5" fill="var(--amber-ink)"/><circle cx="20" cy="9" r="1.6" fill="var(--amber-ink)" fill-opacity=".5"/></svg>';
 
-async function api(path, options) {
-  const res = await fetch(path, options);
+async function api(path, options = {}) {
+  // the server only accepts changes carrying this header (blocks other websites)
+  const res = await fetch(path, { ...options, headers: { ...options.headers, "X-Requested-With": "music-findr" } });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.detail || `${res.status} ${res.statusText}`);
   return body;
@@ -588,12 +589,14 @@ function movesList(items, total) {
     : `<li><span>${esc(m.from)}</span><span class="to">to ${esc(m.to)}</span></li>`).join("")}${more}</ul>`;
 }
 
+let previewed = ""; // the plan the user saw; "Move" applies exactly that
 async function organize(apply, button) {
   const out = $("#tidyResult");
   button.disabled = true;
   out.innerHTML = `<p>${apply ? "Moving songs…" : "Reading every song's tags…"}</p>`;
   try {
-    const r = await api(`/api/organize?apply=${apply}`, { method: "POST" });
+    const r = await api(`/api/organize?apply=${apply}&plan=${apply ? previewed : ""}`, { method: "POST" });
+    previewed = r.plan;
     const n = r.counts;
     if (apply) {
       toast(`Moved ${plural(r.moved, "song")} into artist and album folders`);
@@ -605,7 +608,7 @@ async function organize(apply, button) {
          <div class="actions"><button class="primary" data-tidy="apply">Move ${plural(n.moves, "song")}</button></div>`
       : `<p><strong>Everything is already in the right place.</strong></p>`;
     if (n.conflicts) html += `<details><summary>${plural(n.conflicts, "song")} would land on a file that's already there (probably a duplicate), so ${n.conflicts === 1 ? "it stays" : "they stay"} put</summary>${movesList(r.conflicts, n.conflicts)}</details>`;
-    if (n.untagged) html += `<details><summary>${plural(n.untagged, "file")} without album tags ${n.untagged === 1 ? "stays" : "stay"} where ${n.untagged === 1 ? "it is" : "they are"}</summary>${movesList(r.untagged, n.untagged)}</details>`;
+    if (n.untagged) html += `<details><summary>${plural(n.untagged, "file")} with missing or unusable tags ${n.untagged === 1 ? "stays" : "stay"} where ${n.untagged === 1 ? "it is" : "they are"}</summary>${movesList(r.untagged, n.untagged)}</details>`;
     out.innerHTML = html;
   } catch (e) {
     out.innerHTML = `<p>${esc(e.message)}</p>`;

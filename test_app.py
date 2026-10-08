@@ -12,6 +12,7 @@ import app
 
 app.STATE = Path(tempfile.mkdtemp()) / "jobs.json"  # keep the real queue file out of it
 client = TestClient(app.app)
+client.headers["X-Requested-With"] = "music-findr"  # what the UI sends on every change
 
 
 def check_links():
@@ -38,6 +39,20 @@ def check_browse():
 
 def song(url, name, duration=200, artist="A"):
     return NS(url=url, name=name, artists=[artist], duration=duration, display_name=f"{artist} - {name}")
+
+
+def check_cross_site_guard():
+    import os
+
+    here = os.getcwd()
+    os.chdir(tempfile.mkdtemp())  # if the guard ever breaks, organize runs on an empty folder
+    try:
+        stranger = TestClient(app.app)  # e.g. a form or fetch on some other website
+        assert stranger.post("/api/organize", params={"apply": True}).status_code == 403
+        assert stranger.post("/api/downloads", json={"kind": "track", "id": "abc"}).status_code == 403
+        assert stranger.get("/api/downloads").status_code == 200  # reading is fine
+    finally:
+        os.chdir(here)
 
 
 def check_jobs():
@@ -117,12 +132,12 @@ def check_organize_and_library():
                     "-t", "1", "-q:a", "9", str(silence)], check=True)
     png = b"\x89PNG\r\n\x1a\nfake"
 
-    def tagged(rel, title, track, cover=False):
+    def tagged(rel, title, track, cover=False, album_artist="Radiohead"):
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(silence, path)
         tags = EasyID3()
-        tags.update({"title": title, "artist": "Radiohead", "albumartist": "Radiohead",
+        tags.update({"title": title, "artist": "Radiohead", "albumartist": album_artist,
                      "album": "OK Computer", "tracknumber": f"{track}/12"})
         tags.save(path)
         if cover:
@@ -135,17 +150,23 @@ def check_organize_and_library():
     tagged("old/Radiohead - Lucky.mp3", "Lucky", 11)  # its folder empties out
     tagged("Radiohead/OK Computer/03 - Subterranean Homesick Alien.mp3", "Subterranean Homesick Alien", 3)
     tagged("dupe/Radiohead - Airbag.mp3", "Airbag", 1)  # wants the same spot as the first
+    tagged("sneaky.mp3", "Sneaky", 1, album_artist="..")  # would plan ../OK Computer/...
     silence.rename(root / "untagged.mp3")
     here = os.getcwd()
     os.chdir(root)
     try:
         assert client.get("/api/library").json()["unorganized"] == 2
         preview = client.post("/api/organize").json()
-        assert preview["counts"] == {"moves": 2, "conflicts": 1, "untagged": 1}, preview
+        assert preview["counts"] == {"moves": 2, "conflicts": 1, "untagged": 2}, preview
+        assert "sneaky.mp3" in preview["untagged"]  # never planned outside the folder
         assert preview["in_place"] == 1 and not preview["applied"]
         assert (root / "Radiohead - Airbag.mp3").exists()  # a preview moves nothing
 
-        assert client.post("/api/organize", params={"apply": True}).json()["moved"] == 2
+        # apply only does what was previewed: a changed folder needs a new check
+        stale = client.post("/api/organize", params={"apply": True, "plan": "not-the-plan"})
+        assert stale.status_code == 409 and (root / "Radiohead - Airbag.mp3").exists()
+        done = client.post("/api/organize", params={"apply": True, "plan": preview["plan"]}).json()
+        assert done["moved"] == 2 and not (root.parent / "OK Computer").exists()
         album = root / "Radiohead" / "OK Computer"
         assert sorted(p.name for p in album.iterdir()) == [
             "01 - Airbag.lrc", "01 - Airbag.mp3", "03 - Subterranean Homesick Alien.mp3", "11 - Lucky.mp3"]
@@ -157,17 +178,18 @@ def check_organize_and_library():
         (root / "broken.mp3").write_bytes(b"not audio")  # e.g. cut off mid-download
         lib = client.get("/api/library").json()
         songs = lib["songs"]
-        assert len(songs) == 5 and "broken.mp3" not in {s["path"] for s in songs}, songs
+        assert len(songs) == 6 and "broken.mp3" not in {s["path"] for s in songs}, songs
         assert lib["unorganized"] == 0
         airbag = next(s for s in songs if s["path"] == "Radiohead/OK Computer/01 - Airbag.mp3")
         assert (airbag["track"], airbag["album"], airbag["art"]) == (1, "OK Computer", True), airbag
         cover = client.get("/api/library/cover", params={"path": airbag["path"]})
         assert cover.content == png and cover.headers["content-type"] == "image/png"
         assert client.get("/api/library/cover", params={"path": "untagged.mp3"}).status_code == 404
+        assert client.get("/api/library/cover", params={"path": "broken.mp3"}).status_code == 404
         assert client.get("/api/library/cover", params={"path": "../../etc/passwd"}).status_code == 404
 
         app.library.acquire()  # a download is running
-        assert client.post("/api/organize", params={"apply": True}).status_code == 409
+        assert client.post("/api/organize", params={"apply": True, "plan": again["plan"]}).status_code == 409
         app.library.release()
     finally:
         os.chdir(here)
@@ -202,6 +224,7 @@ def check_restart():
     app.STATE.write_text(json.dumps([
         {**base, "job": "j1", "status": "downloading", "songs": {
             "u1": entry("downloading", cut), "u2": entry("done", finished), "u3": entry("queued", older)}},
+        {"job": "garbled"},  # a damaged entry is skipped, not fatal
         {**base, "job": "j0", "status": "done", "songs": {}},
     ]))
     with app.lock:
@@ -211,7 +234,7 @@ def check_restart():
 
     app.restore()
     assert not cut.exists() and finished.exists() and older.exists()
-    assert [j["job"] for j in app.jobs] == ["j1", "j0"]
+    assert [j["job"] for j in app.jobs] == ["j1", "j0"], [j["job"] for j in app.jobs]
     assert (app.jobs[0]["status"], app.jobs[0]["songs"]) == ("queued", {})
     assert app.pending.get_nowait() is app.jobs[0] and app.pending.empty()
 
@@ -228,6 +251,7 @@ def check_home():
 
 if __name__ == "__main__":
     check_links()
+    check_cross_site_guard()
     check_jobs()
     check_organize_and_library()
     check_restart()
