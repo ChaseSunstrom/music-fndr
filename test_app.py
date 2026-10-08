@@ -167,7 +167,10 @@ def check_organize_and_library():
         # apply only does what was previewed: a changed folder needs a new check
         stale = client.post("/api/organize", params={"apply": True, "plan": "not-the-plan"})
         assert stale.status_code == 409 and (root / "Radiohead - Airbag.mp3").exists()
+        app.remember("plx", "Linked playlist")  # its paths change when files move
         done = client.post("/api/organize", params={"apply": True, "plan": preview["plan"]}).json()
+        assert any(j["kind"] == "playlist" and j["id"] == "plx" for j in app.jobs)  # re-synced to the new paths
+        app.forget_playlist("plx")
         assert done["moved"] == 2 and not (root.parent / "OK Computer").exists()
         album = root / "Radiohead" / "OK Computer"
         assert sorted(p.name for p in album.iterdir()) == [
@@ -416,6 +419,72 @@ def check_playlists():
         os.chdir(here)
 
 
+def check_playlist_reuses_library():
+    """A playlist that lists another release (remaster, single...) of a song you
+    have, or a song sitting unorganized in the folder, links your copy instead."""
+    import os
+    import shutil
+    import subprocess
+
+    from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import ID3, WOAS
+
+    root = Path(tempfile.mkdtemp())
+    silence = root / "silence.mp3"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                    "-t", "1", "-q:a", "9", str(silence)], check=True)
+
+    def have(rel, title, track_id):  # tagged the way spotdl tags its downloads
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(silence, path)
+        tags = EasyID3()
+        tags.update({"title": title, "artist": "Radiohead", "albumartist": "Radiohead", "album": "OK Computer",
+                     "tracknumber": "1/12"})
+        tags.save(path)
+        id3 = ID3(path)
+        id3.add(WOAS(url=f"https://open.spotify.com/track/{track_id}"))
+        id3.save()
+
+    have("Radiohead/OK Computer/01 - Airbag.mp3", "Airbag", "orig1")
+    have("Radiohead - Lucky.mp3", "Lucky", "lucky1")  # not organized yet
+    def track(tid, name, secs=1):
+        return NS(url=f"https://open.spotify.com/track/{tid}", name=name, artists=["Radiohead"], duration=secs,
+                  display_name=f"Radiohead - {name}", list_position=None)
+    listed = [track("rem1", "Airbag - Remastered 2017"),  # same recording, other release
+              track("lucky1", "Lucky", 250),                # same Spotify song, flat file
+              track("tourist", "Airbag - Remastered", 16),  # namesake 15s off: still linked
+              track("live1", "Airbag - Live"),              # a different recording
+              track("new1", "Brand New")]                   # not in the library
+    here = os.getcwd()
+    os.chdir(root)
+    try:
+        with app.lock:
+            app.jobs.clear()
+        job = client.post("/api/downloads", json={"kind": "playlist", "id": "mix", "title": "Mix"}).json()
+        raw = next(j for j in app.jobs if j["job"] == job["job"])
+        fetched = []
+
+        def download(batch):
+            fetched.extend(s.name for s in batch)
+            return [(s, "x.mp3") for s in batch]
+
+        app.run(raw, NS(download_multiple_songs=download), lambda urls: listed)
+        assert fetched == ["Airbag - Live", "Brand New"], fetched
+        assert {u.rsplit("/", 1)[-1] for u, e in raw["songs"].items() if e["status"] == "skipped"} == {"rem1", "lucky1", "tourist"}
+        by_url = {u.rsplit("/", 1)[-1]: e for u, e in raw["songs"].items()}
+        assert by_url["rem1"]["path"] == "Radiohead/OK Computer/01 - Airbag.mp3" and by_url["rem1"]["status"] == "skipped"
+        assert by_url["lucky1"]["path"] == "Radiohead - Lucky.mp3"
+        m3u = Path("Playlists/Mix.m3u8").read_text()
+        assert "../Radiohead/OK Computer/01 - Airbag.mp3" in m3u and "../Radiohead - Lucky.mp3" in m3u, m3u
+    finally:
+        os.chdir(here)
+        shutil.rmtree(root)
+    for title, plain in [("Airbag - Remastered", "airbag"), ("Airbag (2011 Remaster)", "airbag"),
+                         ("Airbag - 2009 Remastered Version", "airbag"), ("Airbag - Live", "airbag - live")]:
+        assert app.plain_title(title) == plain, (title, app.plain_title(title))
+
+
 def check_home():
     h = client.get("/api/home").json()
     assert len(h["chart"]) == 10 and h["new"] and len(h["playlists"]) >= 6, {k: len(v) for k, v in h.items()}
@@ -429,6 +498,7 @@ if __name__ == "__main__":
     check_restart()
     check_spotify_waits()
     check_playlists()
+    check_playlist_reuses_library()
     check_browse()
     check_reconnect()
     check_home()

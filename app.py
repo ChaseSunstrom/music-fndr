@@ -531,6 +531,39 @@ def target(song):
         return None
 
 
+REMASTER = re.compile(r"\s*(?:-\s*|\(|\[)\s*(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?(?:\s+version)?\s*[)\]]?\s*$", re.I)
+
+
+def plain_title(name: str) -> str:
+    """Title without remaster markers: "Airbag - Remastered 2017" is still Airbag
+    (but "Airbag - Live" is a different recording)."""
+    return REMASTER.sub("", name).strip().casefold()
+
+
+def library_songs():
+    """What's already in the folder: by Spotify track id (spotdl tags it), and by
+    (title, main artist) -> [(seconds, file)] for other releases of the same song."""
+    by_id, by_name = {}, {}
+    for rel, meta in scan(Path.cwd()):
+        if not meta.get("name"):
+            continue
+        url = meta.get("url") or ""
+        if "open.spotify.com/track/" in url:
+            by_id[url.rsplit("/", 1)[-1]] = str(rel)
+        key = (plain_title(meta["name"]), ((meta.get("artists") or [""])[0]).casefold())
+        by_name.setdefault(key, []).append(((meta.get("ms") or 0) / 1000, str(rel)))
+    return by_id, by_name
+
+
+def copy_we_have(song, by_id, by_name):
+    if song.url.rsplit("/", 1)[-1] in by_id:
+        return by_id[song.url.rsplit("/", 1)[-1]]
+    key = (plain_title(song.name), (song.artists[0] if song.artists else "").casefold())
+    # file lengths come from the YouTube audio, a few seconds (remasters: up to ~15)
+    # off Spotify's; title and artist already match, this only rules out a namesake
+    return next((path for secs, path in by_name.get(key, []) if abs(secs - song.duration) <= 20), None)
+
+
 def run(job, downloader, resolve, batch=None):
     """Resolve and download a job one release at a time, in small batches,
     so songs arrive (and show up) early and a stop request lands quickly."""
@@ -547,7 +580,7 @@ def run(job, downloader, resolve, batch=None):
         """The same recording on another release (single + album, deluxe...).
         Spotify gives each release its own track id, so match title, artist
         and length instead."""
-        key = (song.name.casefold(), song.artists[0].casefold() if song.artists else "")
+        key = (plain_title(song.name), song.artists[0].casefold() if song.artists else "")
         if any(abs(d - song.duration) <= 3 for d in seen.get(key, [])):
             return True
         seen.setdefault(key, []).append(song.duration)
@@ -578,14 +611,20 @@ def run(job, downloader, resolve, batch=None):
             songs, repeats = [], set()
             for s in found:
                 repeats.add(s.url) if repeat(s) else songs.append(s)
+            # a playlist links the copy you already have, whatever release it came from
+            mine = {}
+            if job["kind"] == "playlist":
+                index = library_songs()
+                mine = {s.url: p for s in songs if (p := copy_we_have(s, *index))}
+                songs = [s for s in songs if s.url not in mine]
             new = {
                 s.url: {
                     "name": s.name,
                     "artists": s.artists,
-                    "status": "duplicate" if s.url in repeats else "queued",
+                    "status": "duplicate" if s.url in repeats else "skipped" if s.url in mine else "queued",
                     "progress": 0,
-                    "message": "",
-                    "path": target(s),
+                    "message": "Using the copy you have" if s.url in mine else "",
+                    "path": mine.get(s.url) or target(s),
                     "pos": getattr(s, "list_position", None),  # order within a playlist
                     "secs": getattr(s, "duration", None),
                 }
@@ -779,6 +818,12 @@ def organize(apply: bool = False, plan: Optional[str] = None):
         found["moved"] = move_files(root, found["moves"]) if apply else 0
     finally:
         library.release()
+    if found["moved"]:  # playlists may link files that just moved
+        busy = busy_ids()
+        with saved_lock:
+            relink = [dict(p) for p in saved.values() if p["id"] not in busy]
+        for p in relink:
+            queue_download("playlist", p["id"], p["name"], p["owner"], p["image"])
     return {
         **{k: v[:300] if isinstance(v, list) else v for k, v in found.items()},
         "counts": {k: len(v) for k, v in found.items() if isinstance(v, list)},

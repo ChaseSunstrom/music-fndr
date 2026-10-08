@@ -59,7 +59,7 @@ All optional. Set them under `environment:`.
 
 ## Playlists
 
-Download a Spotify playlist and it's saved on the **Playlists** page and re-synced every `SYNC_HOURS`: new songs download, and the playlist is updated to match. Songs are never copied; the playlist points at the files in your library.
+Download a Spotify playlist and it's saved on the **Playlists** page and re-synced every `SYNC_HOURS`: new songs download, and the playlist is updated to match. Songs are never copied; the playlist points at the files in your library. If a playlist lists a song you already have (even from another release, such as a remaster, single or deluxe edition, or a file you haven't organized yet), it uses your copy instead of downloading that version.
 
 - **Without Jellyfin settings**, each playlist is written to `/music/Playlists/<name>.m3u8` with paths relative to it. Jellyfin 10.9+, Navidrome and most players import these from the music folder.
 - **With `JELLYFIN_URL` and `JELLYFIN_API_KEY`**, the playlist is created in Jellyfin through its API instead, which is more reliable than Jellyfin's file import. After a sync, music-findr asks Jellyfin to scan, waits for it, then matches songs by file path, so it doesn't matter where Jellyfin mounts the folder. No `.m3u8` is written, so you don't get duplicate playlists.
