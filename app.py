@@ -134,20 +134,31 @@ def playlist_card(p, size=300):
     }
 
 
-_base = Song().base  # shared, so tokens and query hashes are fetched once
+# spotapi starts a fresh session (tokens + query hashes, ~2s) for every object it
+# creates, and spotdl's free client creates one per track. Share a single session:
+# album lookups drop from ~25s to ~7s.
+# ponytail: patches spotapi internals; drop if spotapi starts reusing sessions itself
+_session = Song().base
 
 
-def sp(cls, *args):
-    """A spotapi object on the shared base (~0.6s a lookup instead of ~2.5s)."""
-    obj = cls(*args)
-    obj.base = _base
-    return obj
+def _share_session(cls):
+    init = cls.__init__
+
+    def patched(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.base = _session
+
+    cls.__init__ = patched
+
+
+for _cls in (Song, Artist, PublicAlbum, PublicPlaylist):
+    _share_session(_cls)
 
 
 def discography(artist_id: str, section: str):
     return [
         r
-        for page in sp(Artist).paginate_artist_discography(artist_id, section=section)
+        for page in Artist().paginate_artist_discography(artist_id, section=section)
         for item in page
         for r in each(release, item["releases"]["items"])
     ]
@@ -157,7 +168,7 @@ def discography(artist_id: str, section: str):
 def search(q: str):
     if m := LINK.search(q):
         return {"link": {"type": m[1], "id": m[2]}}
-    s = sp(Song).query_songs(q, limit=12)["data"]["searchV2"]
+    s = Song().query_songs(q, limit=12)["data"]["searchV2"]
     return {
         "tracks": each(lambda i: track(i["item"]["data"]), s["tracksV2"]["items"]),
         "artists": each(lambda i: artist_card(i["data"]), s["artists"]["items"]),
@@ -173,7 +184,7 @@ def artist(artist_id: str):
             s: pool.submit(discography, artist_id, s)
             for s in ("albums", "singles", "compilations")
         }
-        a = sp(Artist).get_artist(artist_id)["data"]["artistUnion"]
+        a = Artist().get_artist(artist_id)["data"]["artistUnion"]
         avatar = (a.get("visuals") or {}).get("avatarImage") or {}
         header = (a.get("headerImage") or {}).get("data") or {}
         return {
@@ -192,7 +203,7 @@ def artist(artist_id: str):
 def album(album_id: str):
     # ponytail: one page of up to 500 tracks; box sets beyond that show truncated
     # (the download itself resolves every track through spotdl)
-    a = sp(PublicAlbum, album_id).get_album_info(limit=500)["data"]["albumUnion"]
+    a = PublicAlbum(album_id).get_album_info(limit=500)["data"]["albumUnion"]
     info = release(a, 640)
     return {
         **info,
@@ -204,7 +215,7 @@ def album(album_id: str):
 
 @app.get("/api/playlist/{playlist_id}")
 def playlist(playlist_id: str):
-    p = sp(PublicPlaylist, playlist_id).get_playlist_info(limit=500)["data"]["playlistV2"]
+    p = PublicPlaylist(playlist_id).get_playlist_info(limit=500)["data"]["playlistV2"]
     return {
         **playlist_card(p, 640),
         "description": p.get("description"),
@@ -232,7 +243,7 @@ _home: dict = {"at": 0.0, "data": None}
 
 def playlist_cover(playlist_id: str):
     try:
-        info = sp(PublicPlaylist, playlist_id).get_playlist_info(limit=1)
+        info = PublicPlaylist(playlist_id).get_playlist_info(limit=1)
         return playlist_card(info["data"]["playlistV2"])
     except Exception:  # editorial playlists come and go by region
         return None
