@@ -366,23 +366,33 @@ def check_playlists():
         assert client.delete("/api/playlists/pl2").status_code == 200
         assert "pl2" not in {p["id"] for p in client.get("/api/playlists").json()["playlists"]}
 
-        # with Jellyfin set up, the playlist is made there from the files it already has
-        calls = []
-        library = [{"Id": "j1", "Path": "/data/music/A/Album/01 - First.mp3"},
-                   {"Id": "j2", "Path": "/data/music/A/Album/02 - Second.mp3"},
-                   {"Id": "jx", "Path": "/data/music/B/Other/02 - Second.mp3"}]
+        # with Jellyfin set up, the playlist is made there right away from the songs
+        # Jellyfin already knows, then topped up once its scan finds the new ones
+        jf = {"library": [{"Id": "j1", "Path": "/data/music/A/Album/01 - First.mp3"},
+                          {"Id": "jx", "Path": "/data/music/B/Other/02 - Second.mp3"}],
+              "playlist": None, "seen_at_create": None, "calls": []}
+        new_song = {"Id": "j2", "Path": "/data/music/A/Album/02 - Second.mp3"}
 
-        def fake(method, path, **kwargs):
-            calls.append((method, path))
+        def fake(method, path, params=None, json=None):
+            jf["calls"].append((method, path))
             if path == "/Users":
                 return [{"Id": "u-admin", "Name": "chase", "Policy": {"IsAdministrator": True}}]
+            if path == "/Library/Refresh":
+                jf["library"].append(new_song)  # the scan finds the new download
             if path == "/ScheduledTasks":
                 return [{"Key": "RefreshLibrary", "State": "Idle"}]
             if path == "/Items":
-                return {"Items": library}
+                return {"Items": list(jf["library"])}
             if path == "/Playlists":
-                assert kwargs["json"]["Ids"] == ["j1", "j2"] and kwargs["json"]["UserId"] == "u-admin", kwargs
+                assert json["UserId"] == "u-admin", json
+                jf["playlist"], jf["seen_at_create"] = list(json["Ids"]), list(json["Ids"])
                 return {"Id": "jp1"}
+            if path == "/Playlists/jp1/Items" and method == "GET":
+                return {"Items": [{"PlaylistItemId": f"e{i}"} for i, _ in enumerate(jf["playlist"])]}
+            if path == "/Playlists/jp1/Items" and method == "DELETE":
+                jf["playlist"] = []
+            if path == "/Playlists/jp1/Items" and method == "POST":
+                jf["playlist"] += params["ids"].split(",")
             return None
 
         app.JELLYFIN.update(url="http://jf:8096", key="k", user="")
@@ -390,11 +400,37 @@ def check_playlists():
         try:
             Path("Playlists/Road Trip.m3u8").unlink()
             app.publish(raw, background=False)
+            assert jf["seen_at_create"] == ["j1"], jf  # made before any scan
+            assert jf["calls"].index(("POST", "/Playlists")) < jf["calls"].index(("POST", "/Library/Refresh"))
+            assert jf["playlist"] == ["j1", "j2"], jf  # topped up after it
             info = next(p for p in client.get("/api/playlists").json()["playlists"] if p["id"] == "pl1")
             assert info["jellyfin_id"] == "jp1" and "2 of 2" in info["jellyfin"], info
-            assert ("POST", "/Library/Refresh") in calls and not Path("Playlists/Road Trip.m3u8").exists()
+            assert not Path("Playlists/Road Trip.m3u8").exists()
+
+            # nothing new to find: no scan at all
+            jf["calls"].clear()
+            app.publish(raw, background=False)
+            assert ("POST", "/Library/Refresh") not in jf["calls"] and jf["playlist"] == ["j1", "j2"], jf
         finally:
             app.jellyfin = real_request
+
+        # the owner is shown once, however the playlist was added
+        app.remember("own", owner="By Chase")
+        assert app.saved["own"]["owner"] == "Chase"
+
+        # after a restart, playlists whose Jellyfin push was cut off sync again,
+        # and owners saved by older versions ("By Chase") are cleaned up
+        app.SAVED.write_text(json.dumps({
+            "cut": {"id": "cut", "name": "Rocky 3", "owner": "By Chase", "image": None, "synced": 1, "songs": 661,
+                    "jellyfin": "Waiting for Jellyfin to pick up new songs…"},
+            "ok": {"id": "ok", "name": "Fine", "owner": None, "image": None, "synced": 1, "songs": 2,
+                   "jellyfin": "In Jellyfin: 2 of 2 songs"}}))
+        with app.lock:
+            app.jobs.clear()
+        app.saved.clear()
+        app.load_saved()
+        assert app.saved["cut"]["owner"] == "Chase"
+        assert [(j["id"], j["subtitle"]) for j in app.jobs if j["kind"] == "playlist"] == [("cut", "By Chase")]
 
         # a sync that fails (say the playlist was deleted on Spotify) waits a full
         # interval before trying again, rather than piling up a failed job every hour

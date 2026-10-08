@@ -823,7 +823,7 @@ def organize(apply: bool = False, plan: Optional[str] = None):
         with saved_lock:
             relink = [dict(p) for p in saved.values() if p["id"] not in busy]
         for p in relink:
-            queue_download("playlist", p["id"], p["name"], p["owner"], p["image"])
+            queue_download("playlist", p["id"], p["name"], p["owner"] and f"By {p['owner']}", p["image"])
     return {
         **{k: v[:300] if isinstance(v, list) else v for k, v in found.items()},
         "counts": {k: len(v) for k, v in found.items() if isinstance(v, list)},
@@ -931,6 +931,22 @@ saved: dict = {}  # playlist id -> what the Playlists page shows
 saved_lock = threading.RLock()  # requests, the worker, auto-sync and Jellyfin pushes all touch it
 
 
+def load_saved():
+    try:
+        stored = json.loads(SAVED.read_text())
+    except (OSError, ValueError):
+        return
+    with saved_lock:
+        saved.update(stored)
+        for p in saved.values():
+            p["owner"] = (p.get("owner") or "").removeprefix("By ") or None  # older versions kept "By "
+        cut_off = [dict(p) for p in saved.values() if "Waiting for Jellyfin" in (p.get("jellyfin") or "")]
+    busy = busy_ids()
+    for p in cut_off:  # a restart stopped its Jellyfin push; sync again (nothing re-downloads)
+        if p["id"] not in busy:
+            queue_download("playlist", p["id"], p["name"], p["owner"] and f"By {p['owner']}", p["image"])
+
+
 def store_saved():
     with saved_lock:
         snapshot = json.loads(json.dumps(saved))
@@ -938,6 +954,7 @@ def store_saved():
 
 
 def remember(pid, name=None, owner=None, image=None):
+    owner = (owner or "").removeprefix("By ") or None  # the UI passes "By Chase"
     with saved_lock:
         entry = saved.setdefault(pid, {"id": pid, "name": None, "owner": None, "image": None, "synced": 0, "songs": 0})
         entry.update({k: v for k, v in {"name": name, "owner": owner, "image": image}.items() if v})
@@ -966,7 +983,7 @@ def sync_due(now):
         with saved_lock:
             saved[p["id"]]["tried"] = now  # a failing sync waits a full interval too
         log.info("Syncing playlist %s", p["name"])
-        queue_download("playlist", p["id"], p["name"], p["owner"], p["image"])
+        queue_download("playlist", p["id"], p["name"], p["owner"] and f"By {p['owner']}", p["image"])
     return len(playlists)
 
 
@@ -1027,8 +1044,8 @@ def jellyfin(method, path, **kwargs):
 
 
 def push_to_jellyfin(entry, paths, settle=10):
-    """Create or refresh the playlist in Jellyfin from items it already has, matched
-    by file path (Jellyfin may mount the folder elsewhere, e.g. /data/music)."""
+    """Make the playlist in Jellyfin right away from the songs it already knows,
+    then, if some are new downloads, have it scan and top the playlist up."""
     try:
         users = jellyfin("GET", "/Users")
         wanted = JELLYFIN["user"].casefold()
@@ -1036,45 +1053,66 @@ def push_to_jellyfin(entry, paths, settle=10):
             (u for u in users if u.get("Policy", {}).get("IsAdministrator")), users[0])
         if user is None:
             raise LookupError(f"there's no Jellyfin user called {JELLYFIN['user']}")
-        jellyfin("POST", "/Library/Refresh")  # so it sees the new downloads
-        for _ in range(180):  # wait for the scan, up to 30 min
-            time.sleep(settle)
-            tasks = jellyfin("GET", "/ScheduledTasks")
-            if all(t.get("State") == "Idle" for t in tasks if t.get("Key") == "RefreshLibrary"):
-                break
-        items = jellyfin("GET", "/Items", params={"Recursive": "true", "IncludeItemTypes": "Audio",
-                                                  "Fields": "Path", "userId": user["Id"]})["Items"]
-        by_name = {}
-        for p in paths:
-            by_name.setdefault(p.rsplit("/", 1)[-1], []).append(p)
-        found = {}
-        for item in items:
-            path = (item.get("Path") or "").replace("\\", "/")
-            for p in by_name.get(path.rsplit("/", 1)[-1], []):
-                if path.endswith("/" + p):
-                    found[p] = item["Id"]
-        ids = [found[p] for p in paths if p in found]
-        pid = entry.get("jellyfin_id")
-        if pid:
-            try:
-                current = jellyfin("GET", f"/Playlists/{pid}/Items", params={"userId": user["Id"]})["Items"]
-            except requests.HTTPError:
-                pid = None  # deleted in Jellyfin; make it again
-        if pid:
-            for chunk in _chunks([i["PlaylistItemId"] for i in current]):
-                jellyfin("DELETE", f"/Playlists/{pid}/Items", params={"entryIds": ",".join(chunk)})
-            for chunk in _chunks(ids):
-                jellyfin("POST", f"/Playlists/{pid}/Items", params={"ids": ",".join(chunk), "userId": user["Id"]})
-        else:
-            made = jellyfin("POST", "/Playlists", json={"Name": entry["name"], "Ids": ids,
-                                                        "UserId": user["Id"], "MediaType": "Audio"})
-            pid = made["Id"]
+        ids = _jellyfin_ids(user, paths)
+        _jellyfin_playlist(entry, user, ids)
+        if len(ids) < len(paths):
+            with saved_lock:
+                entry["jellyfin"] = (f"In Jellyfin: {len(ids)} of {len(paths)} songs. "
+                                     "Waiting for Jellyfin to scan the new ones…")
+            store_saved()
+            jellyfin("POST", "/Library/Refresh")
+            for _ in range(180):  # wait for the scan, up to 30 min
+                time.sleep(settle)
+                tasks = jellyfin("GET", "/ScheduledTasks")
+                if all(t.get("State") == "Idle" for t in tasks if t.get("Key") == "RefreshLibrary"):
+                    break
+            ids = _jellyfin_ids(user, paths)
+            _jellyfin_playlist(entry, user, ids)
         with saved_lock:
-            entry.update(jellyfin_id=pid, jellyfin=f"In Jellyfin: {len(ids)} of {len(paths)} songs")
+            entry["jellyfin"] = f"In Jellyfin: {len(ids)} of {len(paths)} songs"
     except Exception as exc:
         log.exception("Jellyfin playlist update failed")
         with saved_lock:
             entry["jellyfin"] = f"Couldn't update Jellyfin: {exc}"
+    store_saved()
+
+
+def _jellyfin_ids(user, paths):
+    """Jellyfin's ids for our files, in playlist order, matched by path (Jellyfin
+    may mount the folder elsewhere, e.g. /data/music)."""
+    items = jellyfin("GET", "/Items", params={"Recursive": "true", "IncludeItemTypes": "Audio",
+                                              "Fields": "Path", "userId": user["Id"]})["Items"]
+    by_name = {}
+    for p in paths:
+        by_name.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    found = {}
+    for item in items:
+        path = (item.get("Path") or "").replace("\\", "/")
+        for p in by_name.get(path.rsplit("/", 1)[-1], []):
+            if path.endswith("/" + p):
+                found[p] = item["Id"]
+    return [found[p] for p in paths if p in found]
+
+
+def _jellyfin_playlist(entry, user, ids):
+    """Create the playlist, or replace its songs if it's already there."""
+    pid = entry.get("jellyfin_id")
+    if pid:
+        try:
+            current = jellyfin("GET", f"/Playlists/{pid}/Items", params={"userId": user["Id"]})["Items"]
+        except requests.HTTPError:
+            pid = None  # deleted in Jellyfin; make it again
+    if pid:
+        for chunk in _chunks([i["PlaylistItemId"] for i in current]):
+            jellyfin("DELETE", f"/Playlists/{pid}/Items", params={"entryIds": ",".join(chunk)})
+        for chunk in _chunks(ids):
+            jellyfin("POST", f"/Playlists/{pid}/Items", params={"ids": ",".join(chunk), "userId": user["Id"]})
+    else:
+        made = jellyfin("POST", "/Playlists", json={"Name": entry["name"], "Ids": ids,
+                                                    "UserId": user["Id"], "MediaType": "Audio"})
+        pid = made["Id"]
+    with saved_lock:
+        entry["jellyfin_id"] = pid
     store_saved()
 
 
@@ -1097,7 +1135,7 @@ def sync_playlist(pid: str):
         raise HTTPException(404, "That playlist isn't saved")
     if pid in busy_ids():
         raise HTTPException(409, "That playlist is already syncing")
-    return queue_download("playlist", pid, entry["name"], entry["owner"], entry["image"])
+    return queue_download("playlist", pid, entry["name"], entry["owner"] and f"By {entry['owner']}", entry["image"])
 
 
 @app.delete("/api/playlists/{pid}")
@@ -1139,7 +1177,8 @@ def import_links(req: ImportRequest):
         if pid in busy:
             continue
         card = playlist_cover(pid) if kind == "playlist" else None
-        queue_download(kind, pid, card and card["name"], card and card["owner"], card and card["image"])
+        owner = card and card["owner"] and f"By {card['owner']}"
+        queue_download(kind, pid, card and card["name"], owner, card and card["image"])
         busy.add(pid)
         queued += 1
     return {"queued": queued, "ignored": ignored}
@@ -1148,10 +1187,7 @@ def import_links(req: ImportRequest):
 @app.on_event("startup")
 def start_worker():
     restore()
-    try:
-        saved.update(json.loads(SAVED.read_text()))
-    except (OSError, ValueError):
-        pass
+    load_saved()
     threading.Thread(target=worker, daemon=True, name="downloader").start()
     threading.Thread(target=auto_sync, daemon=True, name="playlist-sync").start()
 
