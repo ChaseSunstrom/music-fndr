@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -212,6 +213,53 @@ def playlist(playlist_id: str):
     }
 
 
+HOME_CHART = "37i9dQZEVXbMDoHDwVN2tF"  # Top 50 - Global
+HOME_NEW = "37i9dQZF1DX4JAvHpjipBk"  # New Music Friday
+HOME_PLAYLISTS = [
+    "37i9dQZF1DXcBWIGoYBM5M",  # Today's Top Hits
+    "37i9dQZF1DX0XUsuxWHRQd",  # RapCaviar
+    "37i9dQZF1DWXRqgorJj26U",  # Rock Classics
+    "37i9dQZF1DX4UtSsGT1Sbe",  # All Out 80s
+    "37i9dQZF1DX1lVhptIYRda",  # Hot Country
+    "37i9dQZF1DX10zKzsJ2jva",  # Viva Latino
+    "37i9dQZF1DX4SBhb3fqCJd",  # Are & Be
+    "37i9dQZF1DX4dyzvuaRJ0n",  # mint
+    "37i9dQZF1DWWMOmoXKqHTD",  # Songs to Sing in the Car
+    "37i9dQZF1DX4sWSpwq3LiO",  # Peaceful Piano
+]
+_home: dict = {"at": 0.0, "data": None}
+
+
+def playlist_cover(playlist_id: str):
+    try:
+        info = sp(PublicPlaylist, playlist_id).get_playlist_info(limit=1)
+        return playlist_card(info["data"]["playlistV2"])
+    except Exception:  # editorial playlists come and go by region
+        return None
+
+
+@app.get("/api/home")
+def home():
+    """Charts, new releases and big playlists, cached for an hour."""
+    if _home["data"] and time.time() - _home["at"] < 3600:
+        return _home["data"]
+    with ThreadPoolExecutor(6) as pool:
+        chart = pool.submit(playlist, HOME_CHART)
+        fresh = pool.submit(playlist, HOME_NEW)
+        lists = [p for p in pool.map(playlist_cover, HOME_PLAYLISTS) if p]
+        albums = {}
+        for t in fresh.result()["tracks"]:
+            if t["album"] and t["album"]["id"] not in albums:
+                albums[t["album"]["id"]] = {**t["album"], "image": t["image"], "artists": t["artists"]}
+        _home["data"] = {
+            "chart": chart.result()["tracks"][:10],
+            "new": list(albums.values())[:18],
+            "playlists": lists,
+        }
+        _home["at"] = time.time()
+    return _home["data"]
+
+
 # --- Downloads: one worker thread owning a spotdl Downloader -----------------
 # ponytail: jobs live in memory (history clears on restart) and run one at a
 # time; songs inside a job download THREADS at once.
@@ -253,6 +301,10 @@ def enqueue(req: DownloadRequest):
         "job": uuid.uuid4().hex[:10],
         "status": "queued",
         "error": None,
+        "step": 0,  # which release of `steps` is being worked on
+        "steps": 0,
+        "current": 0,
+        "stop": False,
         "songs": {},
     }
     with lock:
@@ -274,7 +326,8 @@ def remove(job_id: str):
         if job is None:
             raise HTTPException(404, "No such download")
         if job["status"] in ("resolving", "downloading"):
-            raise HTTPException(409, "That download is running; wait for it to finish")
+            job["stop"] = True  # the worker stops after the current batch
+            return {"ok": True, "stopping": True}
         job["status"] = "removed"  # the worker skips it if it was still queued
         jobs.remove(job)
     return {"ok": True}
@@ -300,34 +353,56 @@ def on_progress(tracker, message):
         )
 
 
-def run(job, downloader, resolve):
-    """Resolve a job's songs, then download them, recording status as we go."""
+def run(job, downloader, resolve, batch=20):
+    """Resolve and download a job one release at a time, in small batches,
+    so songs arrive (and show up) early and a stop request lands quickly."""
     with lock:
         if job["status"] != "queued":
             return
         job["status"] = "resolving"
+    active["job"] = job
     try:
-        songs = resolve(spotify_urls(job))
-        if not songs:
-            raise LookupError("Spotify returned no songs for this")
-        job["songs"] = {
-            s.url: {
-                "name": s.name,
-                "artists": s.artists,
-                "status": "queued",
-                "progress": 0,
-                "message": "",
+        urls = spotify_urls(job)
+        job["steps"] = len(urls)
+        for step, url in enumerate(urls, 1):
+            if job["stop"]:
+                break
+            job["step"], job["status"] = step, "resolving"
+            try:
+                songs = [s for s in resolve([url]) if s.url not in job["songs"]]
+            except Exception:  # one unreadable release shouldn't sink a discography
+                if len(urls) == 1:
+                    raise
+                log.exception("skipping %s", url)
+                continue
+            new = {
+                s.url: {
+                    "name": s.name,
+                    "artists": s.artists,
+                    "status": "queued",
+                    "progress": 0,
+                    "message": "",
+                }
+                for s in songs
             }
-            for s in songs
-        }
-        job["title"] = job["title"] or songs[0].display_name
-        job["status"] = "downloading"
-        active["job"] = job
-        for song, path in downloader.download_multiple_songs(songs):
-            entry = job["songs"][song.url]
-            if entry["status"] not in ("done", "skipped"):
-                entry["status"] = "done" if path else "failed"
-        job["status"] = "done"
+            job["songs"] = {**job["songs"], **new}  # swap, so readers never see a half-built dict
+            job["current"] = len(new)  # the newest `current` songs are this release's
+            if songs and not job["title"]:
+                job["title"] = songs[0].display_name
+            job["status"] = "downloading"
+            for i in range(0, len(songs), batch):
+                if job["stop"]:
+                    break
+                for song, path in downloader.download_multiple_songs(songs[i : i + batch]):
+                    entry = job["songs"][song.url]
+                    if entry["status"] not in ("done", "skipped"):
+                        entry["status"] = "done" if path else "failed"
+        if job["stop"]:
+            job["status"] = "stopped"
+        elif not job["songs"]:
+            raise LookupError("Spotify returned no songs for this")
+        else:
+            job["status"] = "done"
     except Exception as exc:  # keep the worker alive; show the reason in the UI
         log.exception("download %s failed", job["job"])
         job["status"], job["error"] = "failed", str(exc)

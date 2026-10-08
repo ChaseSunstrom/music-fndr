@@ -51,15 +51,40 @@ def check_jobs():
     assert [s["status"] for s in done[0]["songs"]] == ["skipped", "done", "failed"]
     assert (done[0]["status"], done[0]["finished"], done[0]["failed"]) == ("done", 3, 1)
 
-    raw["status"] = "downloading"  # a running job can't be removed
-    assert client.delete(f"/api/downloads/{job['job']}").status_code == 409
-    raw["status"] = "queued"
+    raw["status"], raw["songs"] = "queued", {}
     app.run(raw, None, lambda urls: [])  # nothing resolved -> failed with a reason
     assert raw["status"] == "failed" and raw["error"]
+
+    # a discography goes release by release; stopping it lands between batches
+    real_urls = app.spotify_urls
+    app.spotify_urls = lambda job: ["r1", "r2", "r3"]
+    try:
+        disco = client.post("/api/downloads", json={"kind": "artist", "id": "art", "title": "A"}).json()
+        raw = next(j for j in app.jobs if j["job"] == disco["job"])
+        seen = []
+
+        def fake_download(batch):
+            seen.append([s.url for s in batch])
+            if raw["step"] == 2:  # user hits Stop while release 2 downloads
+                assert client.delete(f"/api/downloads/{raw['job']}").json()["stopping"]
+            return [(s, "f.mp3") for s in batch]
+
+        per_release = {u: [NS(url=f"{u}-{i}", name="n", artists=["A"], display_name="A - n") for i in range(3)] for u in ("r1", "r2", "r3")}
+        app.run(raw, NS(download_multiple_songs=fake_download), lambda urls: per_release[urls[0]], batch=2)
+        assert seen == [["r1-0", "r1-1"], ["r1-2"], ["r2-0", "r2-1"]], seen
+        assert (raw["status"], raw["step"], raw["steps"], len(raw["songs"])) == ("stopped", 2, 3, 6)
+    finally:
+        app.spotify_urls = real_urls
+
+
+def check_home():
+    h = client.get("/api/home").json()
+    assert len(h["chart"]) == 10 and h["new"] and len(h["playlists"]) >= 6, {k: len(v) for k, v in h.items()}
 
 
 if __name__ == "__main__":
     check_links()
     check_jobs()
     check_browse()
+    check_home()
     print("ok")
