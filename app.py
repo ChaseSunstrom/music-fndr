@@ -4,6 +4,7 @@ Files land relative to the working directory (/music in the container),
 exactly like `spotdl web --web-use-output-dir`.
 """
 
+import json
 import logging
 import os
 import queue
@@ -272,12 +273,15 @@ def home():
 
 
 # --- Downloads: one worker thread owning a spotdl Downloader -----------------
-# ponytail: jobs live in memory (history clears on restart) and run one at a
-# time; songs inside a job download THREADS at once.
+# Jobs run one at a time (songs inside a job download THREADS at once) and are
+# saved to STATE, so a restart picks up whatever was waiting or running.
 
+STATE = Path(".music-findr/jobs.json")  # inside /music; hidden, so the library skips it
+RUNNING = ("queued", "resolving", "downloading")
 jobs: list = []
 pending: queue.Queue = queue.Queue()
 lock = threading.Lock()
+_saving = threading.Lock()
 active: dict = {}  # {"job": job} while downloading, for the progress callback
 SONG_STATUS = {"Done": "done", "Skipped": "skipped", "Error": "failed"}
 FINISHED = ("done", "skipped", "duplicate", "failed")
@@ -290,6 +294,63 @@ class DownloadRequest(BaseModel):
     title: Optional[str] = None
     subtitle: Optional[str] = None
     image: Optional[str] = None
+
+
+def save():
+    """Write the queue to disk so a restart can carry on with it."""
+    with _saving:
+        with lock:
+            data = json.dumps(jobs)
+        try:
+            STATE.parent.mkdir(exist_ok=True)
+            tmp = STATE.with_suffix(".tmp")
+            tmp.write_text(data)
+            tmp.replace(STATE)
+        except OSError:
+            log.exception("couldn't save the download queue")
+
+
+def reset(job):
+    job.update(status="queued", step=0, steps=0, current=0, stop=False, error=None, songs={})
+
+
+def restore():
+    """Bring back the saved queue; anything that was waiting or running starts again."""
+    try:
+        saved = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return
+    for job in reversed(saved):  # oldest first, the order they were added
+        if job["status"] in RUNNING:
+            drop_partial_files(job)
+            reset(job)
+            pending.put(job)
+    with lock:
+        jobs[:0] = saved
+    log.info("Restored %d downloads, %d to resume", len(saved), pending.qsize())
+
+
+def drop_partial_files(job):
+    """Delete files this job was still writing when the server stopped. spotdl
+    would skip them as already there, and they'd stay broken for good."""
+    for song in job["songs"].values():
+        path = Path(song["path"]) if song.get("path") else None
+        if (
+            song["status"] not in FINISHED
+            and path
+            and path.is_file()
+            and path.stat().st_mtime >= job.get("started", float("inf"))
+            and not read_tags(path).get("name")  # spotdl tags a file once it's complete
+        ):
+            log.info("Removing %s: the restart cut it off mid-download", path)
+            path.unlink()
+
+
+def find(job_id: str):
+    job = next((j for j in jobs if j["job"] == job_id), None)
+    if job is None:
+        raise HTTPException(404, "No such download")
+    return job
 
 
 def view(job):
@@ -323,6 +384,7 @@ def enqueue(req: DownloadRequest):
     with lock:
         jobs.insert(0, job)
     pending.put(job)
+    save()
     return view(job)
 
 
@@ -335,15 +397,27 @@ def downloads():
 @app.delete("/api/downloads/{job_id}")
 def remove(job_id: str):
     with lock:
-        job = next((j for j in jobs if j["job"] == job_id), None)
-        if job is None:
-            raise HTTPException(404, "No such download")
+        job = find(job_id)
         if job["status"] in ("resolving", "downloading"):
             job["stop"] = True  # the worker stops after the current batch
             return {"ok": True, "stopping": True}
         job["status"] = "removed"  # the worker skips it if it was still queued
         jobs.remove(job)
+    save()
     return {"ok": True}
+
+
+@app.post("/api/downloads/{job_id}/retry")
+def retry(job_id: str):
+    """Run a finished, failed or stopped download again; songs already saved are skipped."""
+    with lock:
+        job = find(job_id)
+        if job["status"] in RUNNING:
+            raise HTTPException(409, "That download is already queued")
+        reset(job)
+    pending.put(job)
+    save()
+    return view(job)
 
 
 def spotify_urls(job):
@@ -366,14 +440,26 @@ def on_progress(tracker, message):
         )
 
 
-def run(job, downloader, resolve, batch=20):
+def target(song):
+    """Where spotdl will write a song, so a restart can clean up after it."""
+    from spotdl.utils.formatter import create_file_name
+
+    try:
+        return str(create_file_name(song, SETTINGS["output"], SETTINGS["format"]))
+    except Exception:
+        return None
+
+
+def run(job, downloader, resolve, batch=None):
     """Resolve and download a job one release at a time, in small batches,
     so songs arrive (and show up) early and a stop request lands quickly."""
+    batch = batch or SETTINGS["threads"] * 2
     with lock:
         if job["status"] != "queued":
             return
-        job["status"] = "resolving"
+        job["status"], job["started"] = "resolving", time.time()
     active["job"] = job
+    save()
     seen = {}  # (title, main artist) -> durations already in this job
 
     def repeat(song):
@@ -416,6 +502,7 @@ def run(job, downloader, resolve, batch=20):
                     "status": "duplicate" if s.url in repeats else "queued",
                     "progress": 0,
                     "message": "",
+                    "path": target(s),
                 }
                 for s in found
             }
@@ -424,10 +511,12 @@ def run(job, downloader, resolve, batch=20):
             if found and not job["title"]:
                 job["title"] = found[0].display_name
             job["status"] = "downloading"
+            save()
             for i in range(0, len(songs), batch):
                 if job["stop"]:
                     break
                 fetch(songs[i : i + batch])
+                save()
             missed = [s for s in songs if job["songs"][s.url]["status"] == "failed"]
             if missed and not job["stop"]:
                 fetch(missed)  # YouTube lookups fail now and then; one retry recovers most
@@ -442,6 +531,7 @@ def run(job, downloader, resolve, batch=20):
         job["status"], job["error"] = "failed", str(exc)
     finally:
         active.clear()
+        save()
 
 
 def worker():
@@ -578,6 +668,8 @@ def library_index():
     """Everything in the music folder, one entry per song, for the Library page."""
     songs = []
     for rel, meta in scan(Path.cwd()):
+        if not meta:
+            continue  # unreadable, e.g. half-written by an interrupted download
         url = meta.get("url") or ""
         songs.append(
             {
@@ -595,7 +687,26 @@ def library_index():
                 "art": meta.get("has_art", False),
             }
         )
-    return {"songs": songs}
+    # songs not where OUTPUT puts them; a discography download would fetch them again
+    return {"songs": songs, "unorganized": len(plan_library(Path.cwd())["moves"])}
+
+
+@app.get("/api/library/artist")
+def library_artist(name: str, track: Optional[str] = None):
+    """The Spotify artist behind a name in the music folder: read off one of
+    their songs when we know its Spotify id, else an exact-name search."""
+    wanted = name.casefold()
+    if track and re.fullmatch(r"[A-Za-z0-9]+", track):
+        t = Song().get_track_info(track)["data"]["trackUnion"]
+        credits = (t.get("firstArtist") or {}).get("items", []) + (t.get("otherArtists") or {}).get("items", [])
+        for a in credits:
+            if a["profile"]["name"].casefold() == wanted:
+                return {"id": sid(a["uri"]), "name": a["profile"]["name"]}
+    hits = Song().query_songs(name, limit=5)["data"]["searchV2"]["artists"]["items"]
+    for a in each(lambda i: artist_card(i["data"]), hits):
+        if a["name"].casefold() == wanted:
+            return {"id": a["id"], "name": a["name"]}
+    raise HTTPException(404, f"Couldn't find {name} on Spotify")
 
 
 def _int(value):
@@ -635,6 +746,7 @@ def library_cover(path: str):
 
 @app.on_event("startup")
 def start_worker():
+    restore()
     threading.Thread(target=worker, daemon=True, name="downloader").start()
 
 

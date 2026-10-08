@@ -4,8 +4,13 @@ from types import SimpleNamespace as NS
 
 from fastapi.testclient import TestClient
 
+import json
+import tempfile
+from pathlib import Path
+
 import app
 
+app.STATE = Path(tempfile.mkdtemp()) / "jobs.json"  # keep the real queue file out of it
 client = TestClient(app.app)
 
 
@@ -134,6 +139,7 @@ def check_organize_and_library():
     here = os.getcwd()
     os.chdir(root)
     try:
+        assert client.get("/api/library").json()["unorganized"] == 2
         preview = client.post("/api/organize").json()
         assert preview["counts"] == {"moves": 2, "conflicts": 1, "untagged": 1}, preview
         assert preview["in_place"] == 1 and not preview["applied"]
@@ -148,8 +154,11 @@ def check_organize_and_library():
         again = client.post("/api/organize").json()
         assert again["counts"]["moves"] == 0 and again["in_place"] == 3
 
-        songs = client.get("/api/library").json()["songs"]
-        assert len(songs) == 5, songs
+        (root / "broken.mp3").write_bytes(b"not audio")  # e.g. cut off mid-download
+        lib = client.get("/api/library").json()
+        songs = lib["songs"]
+        assert len(songs) == 5 and "broken.mp3" not in {s["path"] for s in songs}, songs
+        assert lib["unorganized"] == 0
         airbag = next(s for s in songs if s["path"] == "Radiohead/OK Computer/01 - Airbag.mp3")
         assert (airbag["track"], airbag["album"], airbag["art"]) == (1, "OK Computer", True), airbag
         cover = client.get("/api/library/cover", params={"path": airbag["path"]})
@@ -165,6 +174,53 @@ def check_organize_and_library():
         shutil.rmtree(root)
 
 
+def check_library_artist():
+    by_song = client.get("/api/library/artist", params={"name": "radiohead", "track": "7c378mlmubSu7NGkLFa4sN"}).json()
+    by_name = client.get("/api/library/artist", params={"name": "Radiohead"}).json()
+    assert by_song["id"] == by_name["id"] == "4Z8W4fKeB5YxbusRsdQVPb", (by_song, by_name)
+    assert client.get("/api/library/artist", params={"name": "zzqx no such artist qq"}).status_code == 404
+
+
+def check_restart():
+    import os
+    import time
+
+    folder = app.STATE.parent
+    cut = folder / "cut.mp3"  # being written when the server stopped
+    cut.write_bytes(b"half an mp3")
+    finished = folder / "finished.mp3"  # done before the stop, so left alone
+    finished.write_bytes(b"x")
+    older = folder / "older.mp3"  # predates the job, so not ours to touch
+    older.write_bytes(b"x")
+    os.utime(older, (0, 0))
+
+    def entry(status, path):
+        return {"name": "n", "artists": [], "status": status, "progress": 0, "message": "", "path": str(path)}
+
+    base = {"kind": "album", "id": "a", "title": "A", "subtitle": None, "image": None, "error": None,
+            "step": 1, "steps": 1, "current": 3, "stop": False, "started": time.time() - 60}
+    app.STATE.write_text(json.dumps([
+        {**base, "job": "j1", "status": "downloading", "songs": {
+            "u1": entry("downloading", cut), "u2": entry("done", finished), "u3": entry("queued", older)}},
+        {**base, "job": "j0", "status": "done", "songs": {}},
+    ]))
+    with app.lock:
+        app.jobs.clear()
+    while not app.pending.empty():
+        app.pending.get_nowait()
+
+    app.restore()
+    assert not cut.exists() and finished.exists() and older.exists()
+    assert [j["job"] for j in app.jobs] == ["j1", "j0"]
+    assert (app.jobs[0]["status"], app.jobs[0]["songs"]) == ("queued", {})
+    assert app.pending.get_nowait() is app.jobs[0] and app.pending.empty()
+
+    assert client.post("/api/downloads/j0/retry").json()["status"] == "queued"
+    assert client.post("/api/downloads/j1/retry").status_code == 409
+    client.post("/api/downloads", json={"kind": "track", "id": "zzz"})
+    assert json.loads(app.STATE.read_text())[0]["id"] == "zzz"
+
+
 def check_home():
     h = client.get("/api/home").json()
     assert len(h["chart"]) == 10 and h["new"] and len(h["playlists"]) >= 6, {k: len(v) for k, v in h.items()}
@@ -174,6 +230,8 @@ if __name__ == "__main__":
     check_links()
     check_jobs()
     check_organize_and_library()
+    check_restart()
     check_browse()
     check_home()
+    check_library_artist()
     print("ok")

@@ -173,6 +173,11 @@ h2 { font-size: 1.45rem; font-weight: 700; letter-spacing: -0.015em; margin: 40p
 .moves .to { color: var(--dim); }
 .filter { display: block; width: min(100%, 440px); height: 42px; margin-top: 28px; padding: 0 16px; border: 1px solid var(--line); border-radius: 21px; background: var(--raise); color: var(--text); font: inherit; }
 .filter:focus { outline: none; border-color: var(--amber); }
+.shelf-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 40px 0 14px; }
+.shelf-head h2 { margin: 0; }
+.shelf-head .ghost { height: 34px; padding: 0 14px; font-size: .9rem; }
+.lib-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-top: 28px; }
+.lib-tools .filter { margin-top: 0; }
 
 /* grids of covers */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 24px 20px; }
@@ -208,6 +213,9 @@ h2 { font-size: 1.45rem; font-weight: 700; letter-spacing: -0.015em; margin: 40p
 .icon-btn:hover { background: var(--sunk); color: var(--text); }
 .stop { height: 32px; padding: 0 14px; border: 1px solid var(--line); border-radius: 16px; background: transparent; font-size: .88rem; font-weight: 600; }
 .stop:hover { border-color: var(--bad); color: var(--bad); }
+.job-actions { display: flex; align-items: flex-start; gap: 2px; }
+.job-actions .stop { margin-top: 4px; }
+.job-actions .retry:hover { border-color: var(--amber); color: var(--text); }
 .jobs { list-style: none; margin: 0; padding: 8px 12px 24px; overflow-y: auto; flex: 1; }
 .jobs .empty { color: var(--dim); padding: 16px 10px; }
 .job { display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; gap: 4px 12px; padding: 12px 10px; border-bottom: 1px solid var(--line); }
@@ -442,10 +450,12 @@ async function showArtist(t, id) {
 }
 
 let have = new Set(); // Spotify ids of songs already in the music folder
+let unorganized = 0; // songs not yet in Artist/Album folders
 async function loadLibrary() {
-  const { songs } = await api("/api/library");
-  have = new Set(songs.map((s) => s.id).filter(Boolean));
-  return songs;
+  const lib = await api("/api/library");
+  have = new Set(lib.songs.map((s) => s.id).filter(Boolean));
+  unorganized = lib.unorganized;
+  return lib.songs;
 }
 
 const coverUrl = (s) => `/api/library/cover?path=${encodeURIComponent(s.path)}`;
@@ -477,18 +487,50 @@ function localTile(a) {
   </article>`;
 }
 
-const tidyPanel = `<section class="tidy">
+const tidyPanel = () => `<section class="tidy">
   <div class="head">
     <div><strong>Organize your music folder</strong>
-      <p>Moves every song into Artist / Album folders, named the way new downloads are, so nothing gets downloaded twice. Nothing is overwritten or deleted.</p></div>
+      <p>${unorganized
+        ? `${plural(unorganized, "song")} aren't in Artist / Album folders yet. Organize before using Get missing songs, or those songs download again.`
+        : "Moves every song into Artist / Album folders, named the way new downloads are, so nothing gets downloaded twice."} Nothing is overwritten or deleted.</p></div>
     <button class="ghost" data-tidy="check">Check folder</button>
   </div>
   <div id="tidyResult" aria-live="polite"></div>
 </section>`;
 
+let librarySongs = [];
+const completable = (name) => !/^(various artists|unknown artist)$/i.test(name);
+
+// Find the artist on Spotify (from one of their songs here) and queue the
+// discography: songs already in the folder come back "Already there".
+async function completeArtist(name) {
+  const song = librarySongs.find((s) => s.album_artist === name && s.id);
+  const params = new URLSearchParams({ name, ...(song ? { track: song.id } : {}) });
+  const artist = await api(`/api/library/artist?${params}`);
+  await api("/api/downloads", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ kind: "artist", id: artist.id, title: artist.name, subtitle: "Missing songs", image: song && coverUrl(song) }),
+  });
+}
+
+async function completeArtists(names, button) {
+  button.disabled = true;
+  let queued = 0;
+  const missed = [];
+  for (const name of names) {
+    try { await completeArtist(name); queued++; } catch { missed.push(name); }
+    if (names.length > 1) button.textContent = `Queued ${queued + missed.length} of ${names.length}…`;
+  }
+  button.textContent = names.length > 1 ? `Queued ${plural(queued, "artist")}` : "Queued";
+  toast(missed.length
+    ? `Queued ${plural(queued, "artist")}. Couldn't find ${missed.slice(0, 3).join(", ")}${missed.length > 3 ? " and others" : ""} on Spotify.`
+    : `Queued ${names.length > 1 ? plural(queued, "artist") : names[0]}. Songs you already have are skipped.`, true);
+  poll();
+}
+
 async function showLibrary(t, [artist, album] = []) {
   paint(t, `<div class="note">${SPIN}<p>Reading your music folder. The first time can take a minute.</p></div>`);
-  const songs = await loadLibrary();
+  const songs = (librarySongs = await loadLibrary());
   if (artist !== undefined && album !== undefined) return showLocalAlbum(t, songs, artist, album);
   const all = shelves(songs);
   const albums = all.reduce((n, a) => n + a.albums.length, 0);
@@ -499,7 +541,8 @@ async function showLibrary(t, [artist, album] = []) {
       .map(({ name, albums }) => ({ name, albums: !needle || has(name) ? albums : albums.filter((a) => has(a.album) || a.songs.some((s) => has(s.name))) }))
       .filter((a) => a.albums.length);
     return hits.length
-      ? hits.map(({ name, albums }) => section(name, grid(albums.map(localTile).join("")))).join("")
+      ? hits.map(({ name, albums }) => `<div class="shelf-head"><h2>${esc(name)}</h2>${completable(name)
+          ? `<button class="ghost" data-complete="${esc(name)}">Get missing songs</button>` : ""}</div>${grid(albums.map(localTile).join(""))}`).join("")
       : `<p class="note" style="padding:24px 0">Nothing in your library matches “${esc(q)}”.</p>`;
   };
   paint(t, `<section class="home">
@@ -507,8 +550,11 @@ async function showLibrary(t, [artist, album] = []) {
       <p>${plural(all.length, "artist")}, ${plural(albums, "album")} and ${plural(songs.length, "song")} in your music folder.</p>
     </section>
     <div class="wrap">
-      ${tidyPanel}
-      ${songs.length ? `<input class="filter" id="filter" type="search" placeholder="Filter by artist, album or song" aria-label="Filter your library">` : ""}
+      ${tidyPanel()}
+      ${songs.length ? `<div class="lib-tools">
+        <input class="filter" id="filter" type="search" placeholder="Filter by artist, album or song" aria-label="Filter your library">
+        <button class="ghost" data-complete-all>Get missing songs for every artist</button>
+      </div>` : ""}
       <div id="shelf">${songs.length ? render("") : `<p class="note" style="padding:24px 0">Your music folder is empty. Search for something above and download it.</p>`}</div>
     </div>`);
   $("#filter")?.addEventListener("input", (e) => { $("#shelf").innerHTML = render(e.target.value); });
@@ -652,6 +698,23 @@ async function queueDownload(item, button) {
 document.addEventListener("click", (e) => {
   const dl = e.target.closest("[data-dl]");
   if (dl) queueDownload(JSON.parse(dl.dataset.dl), dl);
+  const again = e.target.closest("[data-retry]");
+  if (again) {
+    again.disabled = true;
+    api(`/api/downloads/${again.dataset.retry}/retry`, { method: "POST" }).then(
+      () => { toast("Queued again. Songs already saved are skipped."); poll(); },
+      (err) => { again.disabled = false; toast(err.message); });
+  }
+  const one = e.target.closest("[data-complete]");
+  if (one && (!unorganized || confirm(`${plural(unorganized, "song")} in your folder aren't organized yet, so some could download again. Continue anyway?`))) {
+    completeArtists([one.dataset.complete], one);
+  }
+  const all = e.target.closest("[data-complete-all]");
+  if (all) {
+    const names = [...new Set(librarySongs.map((s) => s.album_artist))].filter(completable);
+    const warn = unorganized ? `\n\n${plural(unorganized, "song")} aren't organized yet and would download again. Organize your folder first.` : "";
+    if (confirm(`Queue the full discography of ${plural(names.length, "artist")}? Songs you already have are skipped, so only missing ones download.${warn}`)) completeArtists(names, all);
+  }
   const tidy = e.target.closest("[data-tidy]");
   if (tidy) organize(tidy.dataset.tidy === "apply", tidy);
   const rm = e.target.closest("[data-remove]");
@@ -720,7 +783,9 @@ function jobItem(j) {
     </div>
     ${["resolving", "downloading"].includes(j.status)
       ? (j.stop ? "<span></span>" : `<button class="stop" data-remove="${esc(j.job)}" aria-label="Stop ${esc(j.title || "download")}">Stop</button>`)
-      : `<button class="icon-btn" data-remove="${esc(j.job)}" aria-label="Remove ${esc(j.title || "download")}">${ICON.x}</button>`}
+      : `<span class="job-actions">${failed || j.status === "stopped"
+          ? `<button class="stop retry" data-retry="${esc(j.job)}" aria-label="Retry ${esc(j.title || "download")}">Retry</button>` : ""}
+          <button class="icon-btn" data-remove="${esc(j.job)}" aria-label="Remove ${esc(j.title || "download")}">${ICON.x}</button></span>`}
     ${songs}
   </li>`;
 }
