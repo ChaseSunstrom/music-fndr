@@ -37,6 +37,10 @@ All optional. Set them under `environment:`.
 | `BITRATE` | `128k` | For example `320k`, or `disable` to keep the source quality |
 | `THREADS` | `4` | How many songs download at the same time |
 | `PORT`    | `8800` | The port the web UI listens on |
+| `SYNC_HOURS` | `24` | How often saved playlists re-sync. `0` turns it off. |
+| `JELLYFIN_URL` | | For example `http://192.168.1.10:8096`. With `JELLYFIN_API_KEY`, playlists are created in Jellyfin directly. |
+| `JELLYFIN_API_KEY` | | Jellyfin → Dashboard → API Keys → + |
+| `JELLYFIN_USER` | first admin | Whose account the playlists belong to |
 
 ## How downloads behave
 
@@ -53,9 +57,17 @@ All optional. Set them under `environment:`.
 - **Organize your music folder** moves existing files into the `OUTPUT` layout (Artist/Album folders by default) using their tags. It shows every move before doing anything, and **Move** applies exactly that preview. It never overwrites or deletes your files: files with missing tags, and files that would land on an existing file, stay where they are. Folders left empty are removed. Keep `FORMAT` the same as your existing files (spotDL's default is mp3) so they're recognised. Run this once if you're coming from spotDL's flat layout; otherwise songs you already have won't be recognised.
 - **Get missing songs**, on each artist or on every artist at once, finds the artist on Spotify and queues their discography. Songs you have come back as "Already there", so a finished download tells you what was missing.
 
+## Playlists
+
+Download a Spotify playlist and it's saved on the **Playlists** page and re-synced every `SYNC_HOURS`: new songs download, and the playlist is updated to match. Songs are never copied; the playlist points at the files in your library.
+
+- **Without Jellyfin settings**, each playlist is written to `/music/Playlists/<name>.m3u8` with paths relative to it. Jellyfin 10.9+, Navidrome and most players import these from the music folder.
+- **With `JELLYFIN_URL` and `JELLYFIN_API_KEY`**, the playlist is created in Jellyfin through its API instead, which is more reliable than Jellyfin's file import. After a sync, music-findr asks Jellyfin to scan, waits for it, then matches songs by file path, so it doesn't matter where Jellyfin mounts the folder. No `.m3u8` is written, so you don't get duplicate playlists.
+- **Import / export:** **Export playlists** downloads a text file of your playlist links. **Import links** takes a pasted list or a text file of Spotify links (playlists, albums, artists or songs, one per line; lines starting with `#` are ignored) and downloads them all.
+
 ## Rate limits
 
-Spotify lookups use the same anonymous access as the Spotify web player, so there's no API key to get banned. Audio comes from YouTube, which can slow down or block heavy use. If many songs show "Couldn't download", lower `THREADS` and use **Retry** later.
+Spotify lookups use the same anonymous access as the Spotify web player, so there's no API key to get banned, but Spotify does limit how fast one server can look things up. When it does (or can't be reached), downloads show "Can't reach Spotify" and wait, retrying after 1, 2, 4… up to 30 minutes, instead of failing. Audio comes from YouTube, which can also slow down or block heavy use; if many songs show "Couldn't download", lower `THREADS` and use **Retry failed** later.
 
 ## Updating
 

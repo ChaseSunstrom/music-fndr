@@ -14,14 +14,19 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from spotapi import Artist, PublicAlbum, PublicPlaylist, Song
+from spotapi.client import BaseClient
+from spotapi.exceptions import BaseClientError, RequestError
+from spotapi.http.request import TLSClient
 
 SETTINGS = {
     "output": os.environ.get(
@@ -54,7 +59,15 @@ async def same_site_only(request: Request, call_next):
 @app.exception_handler(Exception)
 def upstream_error(_: Request, exc: Exception):
     log.exception("request failed")
-    return JSONResponse({"detail": f"Spotify lookup failed: {exc}"}, status_code=502)
+    return JSONResponse({"detail": f"Spotify lookup failed: {why(exc)}"}, status_code=502)
+
+
+def why(exc: Exception) -> str:
+    """The message, plus the connection detail spotapi keeps to itself."""
+    detail = str(getattr(exc, "error", None) or "")
+    if "429" in detail:
+        return "Spotify is rate-limiting this server (429 Too Many Requests); it usually clears up within an hour"
+    return f"{exc} ({detail[:200]})" if detail else str(exc)
 
 
 # --- Spotify (partner API via spotapi, no credentials) -> small JSON ---------
@@ -147,9 +160,28 @@ def playlist_card(p, size=300):
 
 # spotapi starts a fresh session (tokens + query hashes, ~2s) for every object it
 # creates, and spotdl's free client creates one per track. Share a single session:
-# album lookups drop from ~25s to ~7s.
+# album lookups drop from ~25s to ~7s. It gets its own connection: spotapi's default
+# one is shared by every object, and each new object re-points its login at itself.
 # ponytail: patches spotapi internals; drop if spotapi starts reusing sessions itself
-_session = Song().base
+
+
+def _fresh_session():
+    return BaseClient(client=TLSClient("chrome120", "", auto_retries=3))
+
+
+_session = _fresh_session()
+
+
+def spotify(call):
+    """Run a Spotify lookup. If the connection is broken, start a fresh session
+    and try once more, so one bad connection can't take everything down."""
+    global _session
+    try:
+        return call()
+    except RequestError as exc:
+        log.warning("Spotify connection failed (%s); starting a fresh session", why(exc))
+        _session = _fresh_session()
+        return call()
 
 
 def _share_session(cls):
@@ -167,19 +199,21 @@ for _cls in (Song, Artist, PublicAlbum, PublicPlaylist):
 
 
 def discography(artist_id: str, section: str):
-    return [
-        r
-        for page in Artist().paginate_artist_discography(artist_id, section=section)
-        for item in page
-        for r in each(release, item["releases"]["items"])
-    ]
+    return spotify(
+        lambda: [
+            r
+            for page in Artist().paginate_artist_discography(artist_id, section=section)
+            for item in page
+            for r in each(release, item["releases"]["items"])
+        ]
+    )
 
 
 @app.get("/api/search")
 def search(q: str):
     if m := LINK.search(q):
         return {"link": {"type": m[1], "id": m[2]}}
-    s = Song().query_songs(q, limit=12)["data"]["searchV2"]
+    s = spotify(lambda: Song().query_songs(q, limit=12))["data"]["searchV2"]
     return {
         "tracks": each(lambda i: track(i["item"]["data"]), s["tracksV2"]["items"]),
         "artists": each(lambda i: artist_card(i["data"]), s["artists"]["items"]),
@@ -195,7 +229,7 @@ def artist(artist_id: str):
             s: pool.submit(discography, artist_id, s)
             for s in ("albums", "singles", "compilations")
         }
-        a = Artist().get_artist(artist_id)["data"]["artistUnion"]
+        a = spotify(lambda: Artist().get_artist(artist_id))["data"]["artistUnion"]
         avatar = (a.get("visuals") or {}).get("avatarImage") or {}
         header = (a.get("headerImage") or {}).get("data") or {}
         return {
@@ -214,7 +248,7 @@ def artist(artist_id: str):
 def album(album_id: str):
     # ponytail: one page of up to 500 tracks; box sets beyond that show truncated
     # (the download itself resolves every track through spotdl)
-    a = PublicAlbum(album_id).get_album_info(limit=500)["data"]["albumUnion"]
+    a = spotify(lambda: PublicAlbum(album_id).get_album_info(limit=500))["data"]["albumUnion"]
     info = release(a, 640)
     return {
         **info,
@@ -226,7 +260,7 @@ def album(album_id: str):
 
 @app.get("/api/playlist/{playlist_id}")
 def playlist(playlist_id: str):
-    p = PublicPlaylist(playlist_id).get_playlist_info(limit=500)["data"]["playlistV2"]
+    p = spotify(lambda: PublicPlaylist(playlist_id).get_playlist_info(limit=500))["data"]["playlistV2"]
     return {
         **playlist_card(p, 640),
         "description": p.get("description"),
@@ -255,7 +289,7 @@ _home_lock = threading.Lock()
 
 def playlist_cover(playlist_id: str):
     try:
-        info = PublicPlaylist(playlist_id).get_playlist_info(limit=1)
+        info = spotify(lambda: PublicPlaylist(playlist_id).get_playlist_info(limit=1))
         return playlist_card(info["data"]["playlistV2"])
     except Exception:  # editorial playlists come and go by region
         return None
@@ -299,7 +333,8 @@ def _build_home():
 # saved to STATE, so a restart picks up whatever was waiting or running.
 
 STATE = Path(".music-findr/jobs.json")  # inside /music; hidden, so the library skips it
-RUNNING = ("queued", "resolving", "downloading")
+RUNNING = ("queued", "waiting", "resolving", "downloading")
+KEEP = 300  # finished downloads kept in the history
 jobs: list = []
 pending: queue.Queue = queue.Queue()
 lock = threading.Lock()
@@ -318,18 +353,22 @@ class DownloadRequest(BaseModel):
     image: Optional[str] = None
 
 
+def write_json(path: Path, data):
+    with _saving:
+        try:
+            path.parent.mkdir(exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(path)
+        except OSError:
+            log.exception("couldn't save %s", path)
+
+
 def save():
     """Write the queue to disk so a restart can carry on with it."""
-    with _saving:
-        with lock:
-            data = json.dumps(jobs)
-        try:
-            STATE.parent.mkdir(exist_ok=True)
-            tmp = STATE.with_suffix(".tmp")
-            tmp.write_text(data)
-            tmp.replace(STATE)
-        except OSError:
-            log.exception("couldn't save the download queue")
+    with lock:
+        snapshot = json.loads(json.dumps(jobs))
+    write_json(STATE, snapshot)
 
 
 def reset(job):
@@ -396,12 +435,22 @@ def view(job):
 
 @app.post("/api/downloads")
 def enqueue(req: DownloadRequest):
-    if req.kind not in ("track", "album", "artist", "playlist"):
+    return queue_download(**req.model_dump())
+
+
+def queue_download(kind, id, title=None, subtitle=None, image=None):
+    if kind not in ("track", "album", "artist", "playlist"):
         raise HTTPException(422, "kind must be track, album, artist or playlist")
-    if not re.fullmatch(r"[A-Za-z0-9]+", req.id):
+    if not re.fullmatch(r"[A-Za-z0-9]+", id):
         raise HTTPException(422, "id must be a Spotify id")
+    if kind == "playlist":
+        remember(id, title, subtitle, image)
     job = {
-        **req.model_dump(),
+        "kind": kind,
+        "id": id,
+        "title": title,
+        "subtitle": subtitle,
+        "image": image,
         "job": uuid.uuid4().hex[:10],
         "status": "queued",
         "error": None,
@@ -413,6 +462,8 @@ def enqueue(req: DownloadRequest):
     }
     with lock:
         jobs.insert(0, job)
+        for old in [j for j in jobs if j["status"] not in RUNNING][KEEP:]:
+            jobs.remove(old)  # newest first, so these are the oldest finished ones
     pending.put(job)
     save()
     return view(job)
@@ -487,7 +538,7 @@ def run(job, downloader, resolve, batch=None):
     with lock:
         if job["status"] != "queued":
             return
-        job["status"], job["started"] = "resolving", time.time()
+        job["status"], job["started"], job["error"] = "resolving", time.time(), None
     active["job"] = job
     save()
     seen = {}  # (title, main artist) -> durations already in this job
@@ -517,6 +568,8 @@ def run(job, downloader, resolve, batch=None):
             job["step"], job["status"] = step, "resolving"
             try:
                 found = [s for s in resolve([url]) if s.url not in job["songs"]]
+            except (RequestError, BaseClientError):
+                raise  # Spotify itself is unreachable or limiting us: wait, don't skip the rest
             except Exception:  # one unreadable release shouldn't sink a discography
                 if len(urls) == 1:
                     raise
@@ -533,13 +586,15 @@ def run(job, downloader, resolve, batch=None):
                     "progress": 0,
                     "message": "",
                     "path": target(s),
+                    "pos": getattr(s, "list_position", None),  # order within a playlist
+                    "secs": getattr(s, "duration", None),
                 }
                 for s in found
             }
             job["songs"] = {**job["songs"], **new}  # swap, so readers never see a half-built dict
             job["current"] = len(new)  # the newest `current` songs are this release's
             if found and not job["title"]:
-                job["title"] = found[0].display_name
+                job["title"] = (job["kind"] == "playlist" and getattr(found[0], "list_name", None)) or found[0].display_name
             job["status"] = "downloading"
             save()
             for i in range(0, len(songs), batch):
@@ -556,12 +611,39 @@ def run(job, downloader, resolve, batch=None):
             raise LookupError("Spotify returned no songs for this")
         else:
             job["status"] = "done"
+        if job["kind"] == "playlist":
+            try:
+                publish(job)
+            except Exception:  # the songs are saved either way
+                log.exception("couldn't update the playlist for %s", job["title"])
+    except (RequestError, BaseClientError) as exc:  # Spotify unreachable or limiting: work() waits
+        log.warning("download %s waiting: %s", job["job"], why(exc))
+        job["status"], job["error"] = "waiting", f"Can't reach Spotify: {why(exc)}"
     except Exception as exc:  # keep the worker alive; show the reason in the UI
         log.exception("download %s failed", job["job"])
-        job["status"], job["error"] = "failed", str(exc)
+        job["status"], job["error"] = "failed", why(exc)
     finally:
         active.clear()
         save()
+
+
+def work(job, downloader, resolve, sleep=time.sleep):
+    """Run a job. While Spotify can't be reached, keep it waiting and try again,
+    backing off to every 30 min, instead of failing it and everything after it."""
+    wait = 60
+    while True:
+        with library:
+            run(job, downloader, resolve)
+        if job["status"] != "waiting":
+            return
+        job["error"] += f". Trying again in {wait // 60} min."
+        save()
+        sleep(wait)
+        with lock:
+            if job["status"] != "waiting":  # removed while it waited
+                return
+            job["status"] = "queued"
+        wait = min(wait * 2, 1800)
 
 
 def worker():
@@ -573,12 +655,10 @@ def worker():
     SpotifyClient.init(client_id="", client_secret="", no_cache=True)
     downloader = Downloader(SETTINGS)
     downloader.progress_handler.update_callback = on_progress
-    resolve = lambda urls: parse_query(urls, threads=SETTINGS["threads"])  # noqa: E731
+    resolve = lambda urls: spotify(lambda: parse_query(urls, threads=SETTINGS["threads"]))  # noqa: E731
     log.info("Saving to %s as %s", Path.cwd(), SETTINGS["output"])
     while True:
-        job = pending.get()
-        with library:
-            run(job, downloader, resolve)
+        work(pending.get(), downloader, resolve)
 
 
 # --- Organize: move existing files to where OUTPUT says they belong ---------
@@ -740,12 +820,12 @@ def library_artist(name: str, track: Optional[str] = None):
     their songs when we know its Spotify id, else an exact-name search."""
     wanted = name.casefold()
     if track and re.fullmatch(r"[A-Za-z0-9]+", track):
-        t = Song().get_track_info(track)["data"]["trackUnion"]
+        t = spotify(lambda: Song().get_track_info(track))["data"]["trackUnion"]
         credits = (t.get("firstArtist") or {}).get("items", []) + (t.get("otherArtists") or {}).get("items", [])
         for a in credits:
             if a["profile"]["name"].casefold() == wanted:
                 return {"id": sid(a["uri"]), "name": a["profile"]["name"]}
-    hits = Song().query_songs(name, limit=5)["data"]["searchV2"]["artists"]["items"]
+    hits = spotify(lambda: Song().query_songs(name, limit=5))["data"]["searchV2"]["artists"]["items"]
     for a in each(lambda i: artist_card(i["data"]), hits):
         if a["name"].casefold() == wanted:
             return {"id": a["id"], "name": a["name"]}
@@ -792,10 +872,243 @@ def library_cover(path: str):
     return Response(data, media_type=kind, headers={"Cache-Control": "max-age=86400"})
 
 
+# --- Playlists: kept in sync, and pointed at the files (nothing is copied) ---
+
+SAVED = Path(".music-findr/playlists.json")
+PLAYLIST_DIR = Path("Playlists")  # .m3u8 files that Jellyfin, Navidrome and players pick up
+SYNC_HOURS = float(os.environ.get("SYNC_HOURS", "24"))
+JELLYFIN = {
+    "url": os.environ.get("JELLYFIN_URL", "").rstrip("/"),
+    "key": os.environ.get("JELLYFIN_API_KEY", ""),
+    "user": os.environ.get("JELLYFIN_USER", ""),
+}
+saved: dict = {}  # playlist id -> what the Playlists page shows
+saved_lock = threading.RLock()  # requests, the worker, auto-sync and Jellyfin pushes all touch it
+
+
+def store_saved():
+    with saved_lock:
+        snapshot = json.loads(json.dumps(saved))
+    write_json(SAVED, snapshot)
+
+
+def remember(pid, name=None, owner=None, image=None):
+    with saved_lock:
+        entry = saved.setdefault(pid, {"id": pid, "name": None, "owner": None, "image": None, "synced": 0, "songs": 0})
+        entry.update({k: v for k, v in {"name": name, "owner": owner, "image": image}.items() if v})
+    store_saved()
+
+
+def busy_ids():
+    with lock:
+        return {j["id"] for j in jobs if j["status"] in RUNNING}
+
+
+def due(now):
+    """Saved playlists last synced (or tried) more than SYNC_HOURS ago."""
+    if SYNC_HOURS <= 0:
+        return []
+    busy = busy_ids()
+    with saved_lock:
+        return [dict(p) for p in saved.values()
+                if p["id"] not in busy and now - max(p["synced"], p.get("tried", 0)) >= SYNC_HOURS * 3600]
+
+
+def sync_due(now):
+    """Queue the playlists that are due; returns how many."""
+    playlists = due(now)
+    for p in playlists:
+        with saved_lock:
+            saved[p["id"]]["tried"] = now  # a failing sync waits a full interval too
+        log.info("Syncing playlist %s", p["name"])
+        queue_download("playlist", p["id"], p["name"], p["owner"], p["image"])
+    return len(playlists)
+
+
+def auto_sync():
+    while True:
+        time.sleep(3600)
+        try:
+            sync_due(time.time())
+        except Exception:  # never let one bad hour stop syncing for good
+            log.exception("playlist auto-sync failed")
+
+
+def publish(job, background=True):
+    """After a playlist download, make the playlist: in Jellyfin when it's set up,
+    otherwise as a .m3u8 file. Either way it points at the files already there."""
+    songs = sorted(
+        (s for s in job["songs"].values() if s["status"] in ("done", "skipped") and s.get("path")),
+        key=lambda s: s.get("pos") or 0,
+    )
+    with saved_lock:
+        entry = saved.get(job["id"])
+        if entry is None:
+            return  # stopped syncing in the meantime
+        entry.update(name=entry["name"] or job["title"] or "Playlist", songs=len(songs), synced=time.time())
+        if JELLYFIN["url"] and JELLYFIN["key"]:
+            if entry.get("file"):  # Jellyfin would import the file too, as a duplicate
+                Path(entry.pop("file")).unlink(missing_ok=True)
+            entry["jellyfin"] = "Waiting for Jellyfin to pick up new songs…"
+        else:
+            new = str(write_m3u(entry["name"], songs))
+            if entry.get("file") and entry["file"] != new:  # renamed on Spotify
+                Path(entry["file"]).unlink(missing_ok=True)
+            entry["file"] = new
+    store_saved()
+    if JELLYFIN["url"] and JELLYFIN["key"]:
+        push = partial(push_to_jellyfin, entry, [s["path"] for s in songs], settle=10 if background else 0)
+        threading.Thread(target=push, daemon=True).start() if background else push()
+
+
+def write_m3u(name, songs):
+    from spotdl.utils.formatter import sanitize_string
+
+    PLAYLIST_DIR.mkdir(exist_ok=True)
+    path = PLAYLIST_DIR / f"{sanitize_string(name).lstrip('.') or 'Playlist'}.m3u8"
+    lines = ["#EXTM3U", f"#PLAYLIST:{name}"]
+    for s in songs:
+        lines += [f"#EXTINF:{s.get('secs') or -1},{', '.join(s['artists'])} - {s['name']}",
+                  os.path.relpath(s["path"], PLAYLIST_DIR)]  # relative, so any mount point works
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def jellyfin(method, path, **kwargs):
+    auth = f'MediaBrowser Client="music-findr", Device="music-findr", DeviceId="music-findr", Version="1", Token="{JELLYFIN["key"]}"'
+    r = requests.request(method, JELLYFIN["url"] + path, headers={"Authorization": auth}, timeout=60, **kwargs)
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+
+def push_to_jellyfin(entry, paths, settle=10):
+    """Create or refresh the playlist in Jellyfin from items it already has, matched
+    by file path (Jellyfin may mount the folder elsewhere, e.g. /data/music)."""
+    try:
+        users = jellyfin("GET", "/Users")
+        wanted = JELLYFIN["user"].casefold()
+        user = next((u for u in users if u["Name"].casefold() == wanted), None) if wanted else next(
+            (u for u in users if u.get("Policy", {}).get("IsAdministrator")), users[0])
+        if user is None:
+            raise LookupError(f"there's no Jellyfin user called {JELLYFIN['user']}")
+        jellyfin("POST", "/Library/Refresh")  # so it sees the new downloads
+        for _ in range(180):  # wait for the scan, up to 30 min
+            time.sleep(settle)
+            tasks = jellyfin("GET", "/ScheduledTasks")
+            if all(t.get("State") == "Idle" for t in tasks if t.get("Key") == "RefreshLibrary"):
+                break
+        items = jellyfin("GET", "/Items", params={"Recursive": "true", "IncludeItemTypes": "Audio",
+                                                  "Fields": "Path", "userId": user["Id"]})["Items"]
+        by_name = {}
+        for p in paths:
+            by_name.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+        found = {}
+        for item in items:
+            path = (item.get("Path") or "").replace("\\", "/")
+            for p in by_name.get(path.rsplit("/", 1)[-1], []):
+                if path.endswith("/" + p):
+                    found[p] = item["Id"]
+        ids = [found[p] for p in paths if p in found]
+        pid = entry.get("jellyfin_id")
+        if pid:
+            try:
+                current = jellyfin("GET", f"/Playlists/{pid}/Items", params={"userId": user["Id"]})["Items"]
+            except requests.HTTPError:
+                pid = None  # deleted in Jellyfin; make it again
+        if pid:
+            for chunk in _chunks([i["PlaylistItemId"] for i in current]):
+                jellyfin("DELETE", f"/Playlists/{pid}/Items", params={"entryIds": ",".join(chunk)})
+            for chunk in _chunks(ids):
+                jellyfin("POST", f"/Playlists/{pid}/Items", params={"ids": ",".join(chunk), "userId": user["Id"]})
+        else:
+            made = jellyfin("POST", "/Playlists", json={"Name": entry["name"], "Ids": ids,
+                                                        "UserId": user["Id"], "MediaType": "Audio"})
+            pid = made["Id"]
+        with saved_lock:
+            entry.update(jellyfin_id=pid, jellyfin=f"In Jellyfin: {len(ids)} of {len(paths)} songs")
+    except Exception as exc:
+        log.exception("Jellyfin playlist update failed")
+        with saved_lock:
+            entry["jellyfin"] = f"Couldn't update Jellyfin: {exc}"
+    store_saved()
+
+
+def _chunks(items, size=50):
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+@app.get("/api/playlists")
+def playlists():
+    with saved_lock:
+        listed = json.loads(json.dumps(list(saved.values())))
+    return {"playlists": listed, "jellyfin": bool(JELLYFIN["url"] and JELLYFIN["key"]), "sync_hours": SYNC_HOURS}
+
+
+@app.post("/api/playlists/{pid}/sync")
+def sync_playlist(pid: str):
+    with saved_lock:
+        entry = dict(saved.get(pid) or {})
+    if not entry:
+        raise HTTPException(404, "That playlist isn't saved")
+    if pid in busy_ids():
+        raise HTTPException(409, "That playlist is already syncing")
+    return queue_download("playlist", pid, entry["name"], entry["owner"], entry["image"])
+
+
+@app.delete("/api/playlists/{pid}")
+def forget_playlist(pid: str):
+    with saved_lock:
+        saved.pop(pid, None)
+    store_saved()
+    return {"ok": True}
+
+
+@app.get("/api/playlists/export")
+def export_playlists():
+    lines = [f"# music-findr playlists, {time.strftime('%Y-%m-%d')}",
+             "# One Spotify link per line (playlists, albums, artists or songs). Lines starting with # are ignored.", ""]
+    with saved_lock:
+        for p in saved.values():
+            lines += [f"# {p['name']}", f"https://open.spotify.com/playlist/{p['id']}"]
+    return Response("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="music-findr-playlists.txt"'})
+
+
+class ImportRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/import")
+def import_links(req: ImportRequest):
+    """Queue every Spotify link in the text; playlists are saved for syncing."""
+    queued, ignored, busy = 0, [], busy_ids()
+    for line in req.text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = LINK.search(line)
+        if not m:
+            ignored.append(line[:200])
+            continue
+        kind, pid = m[1], m[2]
+        if pid in busy:
+            continue
+        card = playlist_cover(pid) if kind == "playlist" else None
+        queue_download(kind, pid, card and card["name"], card and card["owner"], card and card["image"])
+        busy.add(pid)
+        queued += 1
+    return {"queued": queued, "ignored": ignored}
+
+
 @app.on_event("startup")
 def start_worker():
     restore()
+    try:
+        saved.update(json.loads(SAVED.read_text()))
+    except (OSError, ValueError):
+        pass
     threading.Thread(target=worker, daemon=True, name="downloader").start()
+    threading.Thread(target=auto_sync, daemon=True, name="playlist-sync").start()
 
 
 app.mount(

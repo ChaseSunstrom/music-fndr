@@ -6,11 +6,13 @@ from fastapi.testclient import TestClient
 
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import app
 
 app.STATE = Path(tempfile.mkdtemp()) / "jobs.json"  # keep the real queue file out of it
+app.SAVED = app.STATE.parent / "playlists.json"
 client = TestClient(app.app)
 client.headers["X-Requested-With"] = "music-findr"  # what the UI sends on every change
 
@@ -244,6 +246,176 @@ def check_restart():
     assert json.loads(app.STATE.read_text())[0]["id"] == "zzz"
 
 
+def check_reconnect():
+    """A lookup on a broken connection reconnects with a fresh session and tries once more."""
+    from spotapi.exceptions import RequestError
+
+    broken = RequestError("Failed to complete request.", error="curl: (35) TLS connect error")
+    real_query, sessions = app.Song.query_songs, []
+
+    def flaky(self, *args, **kwargs):
+        sessions.append(self.base)
+        if len(sessions) == 1:
+            raise broken
+        return real_query(self, *args, **kwargs)
+
+    app.Song.query_songs = flaky
+    try:
+        r = client.get("/api/search", params={"q": "radiohead"})
+        assert r.status_code == 200 and r.json()["albums"], r.text
+        assert sessions[0] is not sessions[1]  # the retry ran on a fresh session
+    finally:
+        app.Song.query_songs = real_query
+
+
+
+def check_spotify_waits():
+    """Spotify unreachable or limiting us for a whole job: the queue waits and
+    tries again (instead of failing every queued job in a few seconds)."""
+    from spotapi.exceptions import BaseClientError, RequestError
+
+    broken = RequestError("Failed to complete request.", error="curl: (35) TLS connect error")
+    limited = BaseClientError("Could not get session", error="Status Code: 429, Response: <!DOCTYPE html>...")
+    real_urls, tries, naps = app.spotify_urls, [], []
+
+    def down_twice(job):
+        tries.append(1)
+        if len(tries) <= 2:
+            raise broken if len(tries) == 1 else limited
+        return ["r1"]
+
+    app.spotify_urls = down_twice
+    try:
+        job = client.post("/api/downloads", json={"kind": "artist", "id": "out", "title": "Outage"}).json()
+        raw = next(j for j in app.jobs if j["job"] == job["job"])
+
+        def nap(seconds):
+            naps.append(seconds)
+            detail = "curl: (35)" if len(naps) == 1 else "rate-limiting"
+            assert raw["status"] == "waiting" and detail in raw["error"] and "<" not in raw["error"], raw["error"]
+
+        one = [song("o1", "Only Song")]
+        app.work(raw, NS(download_multiple_songs=lambda b: [(s, "f.mp3") for s in b]), lambda urls: one, sleep=nap)
+        assert raw["status"] == "done" and naps == [60, 120] and raw["error"] is None, (raw["status"], naps)
+
+        # removing a waiting job stops the waiting
+        tries.clear()
+        again = client.post("/api/downloads", json={"kind": "artist", "id": "out2", "title": "Gone"}).json()
+        raw = next(j for j in app.jobs if j["job"] == again["job"])
+        app.work(raw, None, lambda urls: one, sleep=lambda s: client.delete(f"/api/downloads/{raw['job']}"))
+        assert raw["status"] == "removed" and len(tries) == 1
+    finally:
+        app.spotify_urls = real_urls
+
+
+def check_playlists():
+    import os
+
+    here = os.getcwd()
+    os.chdir(tempfile.mkdtemp())
+    real_cover, real_jf = app.playlist_cover, dict(app.JELLYFIN)
+    app.playlist_cover = lambda pid: {"id": pid, "name": f"List {pid}", "owner": "me", "image": None, "color": None}
+    try:
+        with app.lock:
+            app.jobs.clear()
+        app.saved.clear()
+
+        # downloading a playlist saves it for syncing
+        job = client.post("/api/downloads", json={"kind": "playlist", "id": "pl1", "title": "Road Trip"}).json()
+        saved = client.get("/api/playlists").json()["playlists"]
+        assert [(p["id"], p["name"]) for p in saved] == [("pl1", "Road Trip")], saved
+
+        # when it finishes, a .m3u8 points at the files in playlist order (failed ones left out)
+        raw = next(j for j in app.jobs if j["job"] == job["job"])
+
+        def entry(name, path, status, pos):
+            return {"name": name, "artists": ["A"], "status": status, "progress": 100, "message": "",
+                    "path": path, "pos": pos, "secs": 200}
+
+        raw["songs"] = {
+            "u2": entry("Second", "A/Album/02 - Second.mp3", "skipped", 2),
+            "u1": entry("First", "A/Album/01 - First.mp3", "done", 1),
+            "u3": entry("Missing", "A/Album/03 - Missing.mp3", "failed", 3),
+        }
+        raw["status"] = "done"
+        app.publish(raw)
+        m3u = Path("Playlists/Road Trip.m3u8").read_text().splitlines()
+        assert m3u == ["#EXTM3U", "#PLAYLIST:Road Trip", "#EXTINF:200,A - First", "../A/Album/01 - First.mp3",
+                       "#EXTINF:200,A - Second", "../A/Album/02 - Second.mp3"], m3u
+        info = client.get("/api/playlists").json()["playlists"][0]
+        assert info["songs"] == 2 and info["file"] == "Playlists/Road Trip.m3u8" and info["synced"], info
+
+        # syncing is daily: not due yet, due a day later, never twice at once
+        assert app.due(time.time()) == [] and [p["id"] for p in app.due(time.time() + 86400)] == ["pl1"]
+        assert client.post("/api/playlists/pl1/sync").status_code == 200
+        assert client.post("/api/playlists/pl1/sync").status_code == 409  # already queued
+        assert app.due(time.time() + 86400) == []
+
+        # export -> import round trip (comments and junk lines ignored)
+        text = client.get("/api/playlists/export").text
+        assert "# Road Trip" in text and "https://open.spotify.com/playlist/pl1" in text, text
+        extra = "\nhello\nspotify:album:abc123\nhttps://open.spotify.com/playlist/pl2?si=x\n"
+        r = client.post("/api/import", json={"text": text + extra}).json()
+        assert (r["queued"], r["ignored"]) == (2, ["hello"]), r  # pl1 is already queued
+        assert {p["id"]: p["name"] for p in client.get("/api/playlists").json()["playlists"]}["pl2"] == "List pl2"
+
+        # stop syncing forgets it (files stay)
+        assert client.delete("/api/playlists/pl2").status_code == 200
+        assert "pl2" not in {p["id"] for p in client.get("/api/playlists").json()["playlists"]}
+
+        # with Jellyfin set up, the playlist is made there from the files it already has
+        calls = []
+        library = [{"Id": "j1", "Path": "/data/music/A/Album/01 - First.mp3"},
+                   {"Id": "j2", "Path": "/data/music/A/Album/02 - Second.mp3"},
+                   {"Id": "jx", "Path": "/data/music/B/Other/02 - Second.mp3"}]
+
+        def fake(method, path, **kwargs):
+            calls.append((method, path))
+            if path == "/Users":
+                return [{"Id": "u-admin", "Name": "chase", "Policy": {"IsAdministrator": True}}]
+            if path == "/ScheduledTasks":
+                return [{"Key": "RefreshLibrary", "State": "Idle"}]
+            if path == "/Items":
+                return {"Items": library}
+            if path == "/Playlists":
+                assert kwargs["json"]["Ids"] == ["j1", "j2"] and kwargs["json"]["UserId"] == "u-admin", kwargs
+                return {"Id": "jp1"}
+            return None
+
+        app.JELLYFIN.update(url="http://jf:8096", key="k", user="")
+        app.jellyfin, real_request = fake, app.jellyfin
+        try:
+            Path("Playlists/Road Trip.m3u8").unlink()
+            app.publish(raw, background=False)
+            info = next(p for p in client.get("/api/playlists").json()["playlists"] if p["id"] == "pl1")
+            assert info["jellyfin_id"] == "jp1" and "2 of 2" in info["jellyfin"], info
+            assert ("POST", "/Library/Refresh") in calls and not Path("Playlists/Road Trip.m3u8").exists()
+        finally:
+            app.jellyfin = real_request
+
+        # a sync that fails (say the playlist was deleted on Spotify) waits a full
+        # interval before trying again, rather than piling up a failed job every hour
+        with app.lock:
+            app.jobs.clear()
+        app.saved.clear()
+        app.remember("gone", "Deleted list")
+        later = time.time() + 2 * 86400
+        assert app.sync_due(later) == 1
+        app.jobs[0]["status"] = "failed"
+        assert app.sync_due(later + 3600) == 0 and app.sync_due(later + 86400) == 1
+
+        # download history keeps the newest 300 finished jobs
+        with app.lock:
+            app.jobs[:] = [{"job": str(i), "kind": "track", "id": "x", "status": "done", "songs": {}} for i in range(400)]
+        client.post("/api/downloads", json={"kind": "track", "id": "newest"})
+        assert len(app.jobs) == 301 and app.jobs[0]["id"] == "newest" and app.jobs[-1]["job"] == "299"
+    finally:
+        app.playlist_cover = real_cover
+        app.JELLYFIN.clear()
+        app.JELLYFIN.update(real_jf)
+        os.chdir(here)
+
+
 def check_home():
     h = client.get("/api/home").json()
     assert len(h["chart"]) == 10 and h["new"] and len(h["playlists"]) >= 6, {k: len(v) for k, v in h.items()}
@@ -255,7 +427,10 @@ if __name__ == "__main__":
     check_jobs()
     check_organize_and_library()
     check_restart()
+    check_spotify_waits()
+    check_playlists()
     check_browse()
+    check_reconnect()
     check_home()
     check_library_artist()
     print("ok")
