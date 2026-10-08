@@ -465,6 +465,7 @@ def worker():
 
 AUDIO = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".wav"}
 _tags: dict = {}  # path -> (mtime, tags), so later scans only read changed files
+_scanning = threading.Lock()  # one scan at a time; the next one reuses its cache
 
 
 def read_tags(path: Path):
@@ -484,6 +485,11 @@ def read_tags(path: Path):
 
 def scan(root: Path):
     """Every audio file under root (skipping hidden/NAS system folders) with its tags."""
+    with _scanning:
+        return _scan(root)
+
+
+def _scan(root: Path):
     found = []
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)

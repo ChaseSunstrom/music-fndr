@@ -44,7 +44,7 @@ svg.i { width: 1.25em; height: 1.25em; flex: none; }
 /* top bar */
 .bar {
   position: sticky; top: 0; z-index: 10;
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 16px; align-items: center;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 12px 16px; align-items: center;
   padding: 12px var(--edge);
   background: color-mix(in oklab, var(--bg) 88%, transparent);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
@@ -66,13 +66,17 @@ svg.i { width: 1.25em; height: 1.25em; flex: none; }
   display: flex; align-items: center; gap: 8px; height: 44px; padding: 0 16px;
   border: 1px solid var(--line); border-radius: 22px; background: var(--raise); font-weight: 600;
 }
-.queue-btn:hover { border-color: var(--dim); }
+.queue-btn:hover { border-color: var(--dim); text-decoration: none; }
+.queue-btn[aria-current] { border-color: var(--amber); }
 .count { min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px; background: var(--amber); color: var(--amber-ink); font-size: .8rem; font-weight: 700; display: grid; place-items: center; }
 @media (max-width: 720px) {
-  .bar { grid-template-columns: auto auto; }
+  .bar { grid-template-columns: auto 1fr auto auto; }
   .brand span { display: none; }
   .search { grid-column: 1 / -1; grid-row: 2; max-width: none; }
-  .queue-btn { justify-self: end; }
+}
+@media (max-width: 480px) {
+  .queue-btn .label { display: none; }
+  .queue-btn { padding: 0 13px; }
 }
 
 main { padding: 0 0 96px; }
@@ -154,6 +158,21 @@ h2 { font-size: 1.45rem; font-weight: 700; letter-spacing: -0.015em; margin: 40p
 }
 .dl:hover { background: var(--amber); color: var(--amber-ink); }
 .dl.added { color: var(--ok); background: transparent; }
+.have { width: 40px; height: 40px; display: grid; place-items: center; color: var(--ok); }
+
+/* library */
+.tidy { margin-top: 28px; padding: 20px 22px; border: 1px solid var(--line); border-radius: 10px; background: var(--raise); }
+.tidy .head { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; }
+.tidy p { margin: 4px 0 0; color: var(--dim); max-width: 64ch; }
+.tidy #tidyResult:not(:empty) { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.tidy #tidyResult p { color: var(--text); }
+.tidy details { margin-top: 10px; }
+.tidy summary { cursor: pointer; color: var(--dim); }
+.moves { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; max-height: 340px; overflow: auto; font-size: .9rem; }
+.moves li { display: grid; overflow-wrap: anywhere; }
+.moves .to { color: var(--dim); }
+.filter { display: block; width: min(100%, 440px); height: 42px; margin-top: 28px; padding: 0 16px; border: 1px solid var(--line); border-radius: 21px; background: var(--raise); color: var(--text); font: inherit; }
+.filter:focus { outline: none; border-color: var(--amber); }
 
 /* grids of covers */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 24px 20px; }
@@ -234,9 +253,13 @@ h2 { font-size: 1.45rem; font-weight: 700; letter-spacing: -0.015em; margin: 40p
     <label class="vh" for="q">Search Spotify</label>
     <input id="q" type="search" autocomplete="off" spellcheck="false" placeholder="Artists, albums, songs, playlists or a Spotify link">
   </form>
-  <button class="queue-btn" id="openQueue" aria-controls="queue" aria-expanded="false">
+  <a class="queue-btn" id="libLink" href="#/library">
+    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5v15M9.5 4.5v15M14 5l4.5 14.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <span class="label">Library</span>
+  </a>
+  <button class="queue-btn" id="openQueue" aria-controls="queue" aria-expanded="false" aria-label="Downloads">
     <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <span>Downloads</span><span class="count" id="count" hidden></span>
+    <span class="label">Downloads</span><span class="count" id="count" hidden></span>
   </button>
 </header>
 
@@ -303,7 +326,9 @@ function trackRow(t, i, { art = false, album = true } = {}) {
     </span>
     <span class="alb">${album && t.album?.name ? `<a href="#/album/${esc(t.album.id)}">${esc(t.album.name)}</a>` : ""}</span>
     <span class="dur">${mmss(t.ms)}</span>
-    ${dlButton(item, `${t.name} by ${item.subtitle}`)}
+    ${have.has(t.id)
+      ? `<span class="have" role="img" aria-label="In your library" title="In your library">${ICON.ok}</span>`
+      : dlButton(item, `${t.name} by ${item.subtitle}`)}
   </li>`;
 }
 
@@ -381,7 +406,9 @@ async function showSearch(t, q) {
 async function showAlbum(t, id) {
   const a = await api(`/api/album/${id}`);
   const kind = KIND[a.type] || "Album";
-  const meta = `<span>${credits(a.artists)}</span><span>${esc(a.year || "")}</span><span>${plural(a.total, "song")}, ${minutes(a.tracks)} min</span>`;
+  const owned = a.tracks.filter((x) => have.has(x.id)).length;
+  const meta = `<span>${credits(a.artists)}</span><span>${esc(a.year || "")}</span><span>${plural(a.total, "song")}, ${minutes(a.tracks)} min</span>` +
+    (owned ? `<span>${owned === a.tracks.length ? "All" : owned} in your library</span>` : "");
   const item = { kind: "album", id: a.id, title: a.name, subtitle: creditText(a.artists), image: a.image };
   paint(t, hero({ kind, title: a.name, image: a.image, tintColor: a.color, meta, action: bigButton(item, `Download ${kind.toLowerCase()}`) }) +
     `<div class="wrap">${section("Songs", rows(a.tracks, { album: false }))}${a.label ? `<p class="note" style="padding:24px 0">${esc(a.label)}</p>` : ""}</div>`);
@@ -414,6 +441,133 @@ async function showArtist(t, id) {
     </div>`);
 }
 
+let have = new Set(); // Spotify ids of songs already in the music folder
+async function loadLibrary() {
+  const { songs } = await api("/api/library");
+  have = new Set(songs.map((s) => s.id).filter(Boolean));
+  return songs;
+}
+
+const coverUrl = (s) => `/api/library/cover?path=${encodeURIComponent(s.path)}`;
+const libHref = (artist, album) => `#/library/${encodeURIComponent(artist)}/${encodeURIComponent(album)}`;
+
+// artist -> albums -> songs, artists A to Z, newest albums first
+function shelves(songs) {
+  const artists = new Map();
+  for (const s of songs) {
+    if (!artists.has(s.album_artist)) artists.set(s.album_artist, new Map());
+    const albums = artists.get(s.album_artist);
+    if (!albums.has(s.album)) albums.set(s.album, { artist: s.album_artist, album: s.album, year: s.year, songs: [] });
+    const a = albums.get(s.album);
+    a.songs.push(s);
+    a.year ||= s.year;
+    if (!a.cover && s.art) a.cover = coverUrl(s);
+  }
+  return [...artists]
+    .sort(([x], [y]) => x.localeCompare(y, undefined, { sensitivity: "base" }))
+    .map(([name, albums]) => ({ name, albums: [...albums.values()].sort((x, y) => (y.year || 0) - (x.year || 0)) }));
+}
+
+function localTile(a) {
+  const href = libHref(a.artist, a.album);
+  return `<article class="tile">
+    <div class="cover"><a href="${href}" tabindex="-1" aria-hidden="true">${img(a.cover)}</a></div>
+    <a class="name" href="${href}">${esc(a.album || "No album tag")}</a>
+    <span class="sub">${esc([a.year, plural(a.songs.length, "song")].filter(Boolean).join(", "))}</span>
+  </article>`;
+}
+
+const tidyPanel = `<section class="tidy">
+  <div class="head">
+    <div><strong>Organize your music folder</strong>
+      <p>Moves every song into Artist / Album folders, named the way new downloads are, so nothing gets downloaded twice. Nothing is overwritten or deleted.</p></div>
+    <button class="ghost" data-tidy="check">Check folder</button>
+  </div>
+  <div id="tidyResult" aria-live="polite"></div>
+</section>`;
+
+async function showLibrary(t, [artist, album] = []) {
+  paint(t, `<div class="note">${SPIN}<p>Reading your music folder. The first time can take a minute.</p></div>`);
+  const songs = await loadLibrary();
+  if (artist !== undefined && album !== undefined) return showLocalAlbum(t, songs, artist, album);
+  const all = shelves(songs);
+  const albums = all.reduce((n, a) => n + a.albums.length, 0);
+  const render = (q) => {
+    const needle = q.trim().toLowerCase();
+    const has = (text) => (text || "").toLowerCase().includes(needle);
+    const hits = all
+      .map(({ name, albums }) => ({ name, albums: !needle || has(name) ? albums : albums.filter((a) => has(a.album) || a.songs.some((s) => has(s.name))) }))
+      .filter((a) => a.albums.length);
+    return hits.length
+      ? hits.map(({ name, albums }) => section(name, grid(albums.map(localTile).join("")))).join("")
+      : `<p class="note" style="padding:24px 0">Nothing in your library matches “${esc(q)}”.</p>`;
+  };
+  paint(t, `<section class="home">
+      <h1>Your library</h1>
+      <p>${plural(all.length, "artist")}, ${plural(albums, "album")} and ${plural(songs.length, "song")} in your music folder.</p>
+    </section>
+    <div class="wrap">
+      ${tidyPanel}
+      ${songs.length ? `<input class="filter" id="filter" type="search" placeholder="Filter by artist, album or song" aria-label="Filter your library">` : ""}
+      <div id="shelf">${songs.length ? render("") : `<p class="note" style="padding:24px 0">Your music folder is empty. Search for something above and download it.</p>`}</div>
+    </div>`);
+  $("#filter")?.addEventListener("input", (e) => { $("#shelf").innerHTML = render(e.target.value); });
+}
+
+function showLocalAlbum(t, songs, artist, album) {
+  const list = songs
+    .filter((s) => s.album_artist === artist && s.album === album)
+    .sort((a, b) => a.disc - b.disc || (a.track ?? 1e9) - (b.track ?? 1e9) || a.name.localeCompare(b.name));
+  if (!list.length) {
+    return paint(t, `<div class="note"><strong>That album isn't in your library any more</strong>It may have been moved or renamed. <a href="#/library">Back to your library</a></div>`);
+  }
+  const art = list.find((s) => s.art);
+  const year = list.find((s) => s.year)?.year;
+  const folder = list[0].path.split("/").slice(0, -1).join("/") || "The top of your music folder";
+  const meta = `<span><a href="#/library">${esc(artist)}</a></span><span>${esc(year || "")}</span><span>${plural(list.length, "song")}, ${minutes(list)} min</span>`;
+  const row = (s) => `<li class="row">
+    <span class="num">${esc(s.track ?? "")}</span>
+    <span class="what"><span class="title">${esc(s.name)}</span><span class="by">${esc(s.artists.join(", "))}</span></span>
+    <span class="alb" title="${esc(s.path)}">${esc(s.path.split("/").pop())}</span>
+    <span class="dur">${mmss(s.ms)}</span><span></span>
+  </li>`;
+  paint(t, hero({ kind: "In your library", title: album || "Songs without an album tag", image: art && coverUrl(art), meta, action: `<small>${esc(folder)}</small>` }) +
+    `<div class="wrap">${section("Songs", `<ol class="rows">${list.map(row).join("")}</ol>`)}</div>`);
+}
+
+function movesList(items, total) {
+  const more = total > items.length ? `<li>…and ${total - items.length} more</li>` : "";
+  return `<ul class="moves">${items.map((m) => typeof m === "string"
+    ? `<li>${esc(m)}</li>`
+    : `<li><span>${esc(m.from)}</span><span class="to">to ${esc(m.to)}</span></li>`).join("")}${more}</ul>`;
+}
+
+async function organize(apply, button) {
+  const out = $("#tidyResult");
+  button.disabled = true;
+  out.innerHTML = `<p>${apply ? "Moving songs…" : "Reading every song's tags…"}</p>`;
+  try {
+    const r = await api(`/api/organize?apply=${apply}`, { method: "POST" });
+    const n = r.counts;
+    if (apply) {
+      toast(`Moved ${plural(r.moved, "song")} into artist and album folders`);
+      return route();
+    }
+    let html = n.moves
+      ? `<p><strong>${plural(n.moves, "song")} will move</strong>, ${r.in_place} already in the right place.</p>
+         <details><summary>See where they go</summary>${movesList(r.moves, n.moves)}</details>
+         <div class="actions"><button class="primary" data-tidy="apply">Move ${plural(n.moves, "song")}</button></div>`
+      : `<p><strong>Everything is already in the right place.</strong></p>`;
+    if (n.conflicts) html += `<details><summary>${plural(n.conflicts, "song")} would land on a file that's already there (probably a duplicate), so ${n.conflicts === 1 ? "it stays" : "they stay"} put</summary>${movesList(r.conflicts, n.conflicts)}</details>`;
+    if (n.untagged) html += `<details><summary>${plural(n.untagged, "file")} without album tags ${n.untagged === 1 ? "stays" : "stay"} where ${n.untagged === 1 ? "it is" : "they are"}</summary>${movesList(r.untagged, n.untagged)}</details>`;
+    out.innerHTML = html;
+  } catch (e) {
+    out.innerHTML = `<p>${esc(e.message)}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 // Album, artist and playlist links open their page; a song link asks first.
 function openLink(t, link) {
   if (link.type !== "track") {
@@ -432,13 +586,15 @@ function go(hash) {
 async function route() {
   const t = ++ticket;
   const [, view = "", ...rest] = location.hash.split("/");
-  const arg = decodeURIComponent(rest.join("/"));
-  const pages = { search: showSearch, album: showAlbum, playlist: showPlaylist, artist: showArtist };
-  if (!pages[view] || !arg) return showHome(t);
+  const parts = rest.map(decodeURIComponent);
+  const arg = parts.join("/");
+  const pages = { search: showSearch, album: showAlbum, playlist: showPlaylist, artist: showArtist, library: showLibrary };
+  $("#libLink").toggleAttribute("aria-current", view === "library");
+  if (!pages[view] || (!arg && view !== "library")) return showHome(t);
   if (view !== "search") input.value = "";
   paint(t, `<div class="note">${SPIN}</div>`);
   try {
-    await pages[view](t, arg);
+    await pages[view](t, view === "library" ? parts : arg);
     if (view !== "search") scrollTo(0, 0);
   } catch (e) {
     paint(t, `<div class="note"><strong>Couldn't load this</strong>${esc(e.message)}<br><button class="ghost" onclick="route()">Try again</button></div>`);
@@ -496,6 +652,8 @@ async function queueDownload(item, button) {
 document.addEventListener("click", (e) => {
   const dl = e.target.closest("[data-dl]");
   if (dl) queueDownload(JSON.parse(dl.dataset.dl), dl);
+  const tidy = e.target.closest("[data-tidy]");
+  if (tidy) organize(tidy.dataset.tidy === "apply", tidy);
   const rm = e.target.closest("[data-remove]");
   if (rm) {
     rm.disabled = true;
@@ -516,13 +674,14 @@ $("#closeQueue").addEventListener("click", () => { setDrawer(false); $("#openQue
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && drawer.classList.contains("open")) { setDrawer(false); $("#openQueue").focus(); } });
 
 const RUNNING = ["queued", "resolving", "downloading"];
-const SONG_LABEL = { queued: "Waiting", done: "Saved", skipped: "Already there", failed: "Not found" };
+const SONG_LABEL = { queued: "Waiting", done: "Saved", skipped: "Already there", duplicate: "Duplicate, skipped", failed: "Couldn't download" };
+const FINISHED = ["done", "skipped", "duplicate", "failed"];
 let jobs = [], lastJobs = "";
 const expanded = new Set();
 
 function jobState(j) {
   const where = j.steps > 1 ? `release ${j.step} of ${j.steps}` : "";
-  const failed = j.failed ? `, ${j.failed} not found` : "";
+  const failed = j.failed ? `, ${j.failed} couldn't download` : "";
   if (j.status === "queued") return "Waiting to start";
   if (j.stop && RUNNING.includes(j.status)) return "Stopping after the songs in progress…";
   if (j.status === "resolving" && !j.steps) return j.kind === "artist" ? "Listing releases…" : "Finding songs…";
@@ -534,14 +693,15 @@ function jobState(j) {
     j.status === "stopped" && "Stopped",
     count("done") && `${count("done")} saved`,
     count("skipped") && `${count("skipped")} already in your library`,
-    j.failed && `${j.failed} not found`,
+    count("duplicate") && `${plural(count("duplicate"), "duplicate")} skipped`,
+    j.failed && `${j.failed} couldn't download`,
   ].filter(Boolean).join(", ") || "Done";
 }
 
 function jobItem(j) {
   // overall = finished releases + how far the current release's songs have got
   const current = j.status === "downloading" ? j.songs.slice(j.songs.length - j.current) : [];
-  const inner = current.length ? current.reduce((n, s) => n + (["done", "skipped", "failed"].includes(s.status) ? 100 : s.progress), 0) / current.length / 100 : 0;
+  const inner = current.length ? current.reduce((n, s) => n + (FINISHED.includes(s.status) ? 100 : s.progress), 0) / current.length / 100 : 0;
   const pct = j.steps ? (100 * (j.step - 1 + inner)) / j.steps : 0;
   const kind = { track: "Song", album: "Album", playlist: "Playlist", artist: "Discography" }[j.kind];
   const sub = [kind, j.kind === "artist" ? "" : j.subtitle].filter(Boolean).join(", ");
@@ -565,8 +725,11 @@ function jobItem(j) {
   </li>`;
 }
 
+let wasActive = 0;
 function renderJobs() {
   const active = jobs.filter((j) => RUNNING.includes(j.status)).length;
+  if (active < wasActive) loadLibrary().catch(() => {});
+  wasActive = active;
   const count = $("#count");
   count.hidden = !active;
   count.textContent = active;
@@ -593,7 +756,8 @@ $("#clearDone").addEventListener("click", async () => {
 (async function loop() { await poll(); setTimeout(loop, 1500); })();
 
 window.addEventListener("hashchange", route);
-route();
+// marks songs you already have; don't hold the first page for a big first scan
+Promise.race([loadLibrary(), new Promise((done) => setTimeout(done, 1500))]).catch(() => {}).finally(route);
 </script>
 </body>
 </html>
