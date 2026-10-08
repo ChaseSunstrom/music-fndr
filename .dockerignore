@@ -1,0 +1,6 @@
+.venv
+.git
+music
+__pycache__
+*.md
+test_app.py

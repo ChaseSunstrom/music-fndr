@@ -1,0 +1,15 @@
+services:
+  music-findr:
+    build: .
+    image: music-findr:latest
+    container_name: music-findr
+    network_mode: host
+    environment:
+      - PORT=8800
+      # - FORMAT=mp3      # mp3, flac, ogg, opus, m4a or wav
+      # - BITRATE=128k    # e.g. 320k, or "disable" to keep the source quality
+      # - OUTPUT={album-artist}/{album}/{track-number} - {title}.{output-ext}
+      # - THREADS=4       # songs downloaded at once
+    volumes:
+      - ${MUSIC_DIR:-/data/music}:/music
+    restart: unless-stopped
