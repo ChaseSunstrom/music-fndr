@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from spotapi import Artist, PublicAlbum, PublicPlaylist, Song
@@ -280,6 +280,8 @@ pending: queue.Queue = queue.Queue()
 lock = threading.Lock()
 active: dict = {}  # {"job": job} while downloading, for the progress callback
 SONG_STATUS = {"Done": "done", "Skipped": "skipped", "Error": "failed"}
+FINISHED = ("done", "skipped", "duplicate", "failed")
+library = threading.Lock()  # a download and an organize never touch /music at once
 
 
 class DownloadRequest(BaseModel):
@@ -296,7 +298,7 @@ def view(job):
         **{k: v for k, v in job.items() if k != "songs"},
         "songs": songs,
         "total": len(songs),
-        "finished": sum(s["status"] in ("done", "skipped", "failed") for s in songs),
+        "finished": sum(s["status"] in FINISHED for s in songs),
         "failed": sum(s["status"] == "failed" for s in songs),
     }
 
@@ -372,6 +374,24 @@ def run(job, downloader, resolve, batch=20):
             return
         job["status"] = "resolving"
     active["job"] = job
+    seen = {}  # (title, main artist) -> durations already in this job
+
+    def repeat(song):
+        """The same recording on another release (single + album, deluxe...).
+        Spotify gives each release its own track id, so match title, artist
+        and length instead."""
+        key = (song.name.casefold(), song.artists[0].casefold() if song.artists else "")
+        if any(abs(d - song.duration) <= 3 for d in seen.get(key, [])):
+            return True
+        seen.setdefault(key, []).append(song.duration)
+        return False
+
+    def fetch(batch_songs):
+        for song, path in downloader.download_multiple_songs(batch_songs):
+            entry = job["songs"][song.url]
+            if entry["status"] not in ("done", "skipped"):
+                entry["status"] = "done" if path else "failed"
+
     try:
         urls = spotify_urls(job)
         job["steps"] = len(urls)
@@ -380,34 +400,37 @@ def run(job, downloader, resolve, batch=20):
                 break
             job["step"], job["status"] = step, "resolving"
             try:
-                songs = [s for s in resolve([url]) if s.url not in job["songs"]]
+                found = [s for s in resolve([url]) if s.url not in job["songs"]]
             except Exception:  # one unreadable release shouldn't sink a discography
                 if len(urls) == 1:
                     raise
                 log.exception("skipping %s", url)
                 continue
+            songs, repeats = [], set()
+            for s in found:
+                repeats.add(s.url) if repeat(s) else songs.append(s)
             new = {
                 s.url: {
                     "name": s.name,
                     "artists": s.artists,
-                    "status": "queued",
+                    "status": "duplicate" if s.url in repeats else "queued",
                     "progress": 0,
                     "message": "",
                 }
-                for s in songs
+                for s in found
             }
             job["songs"] = {**job["songs"], **new}  # swap, so readers never see a half-built dict
             job["current"] = len(new)  # the newest `current` songs are this release's
-            if songs and not job["title"]:
-                job["title"] = songs[0].display_name
+            if found and not job["title"]:
+                job["title"] = found[0].display_name
             job["status"] = "downloading"
             for i in range(0, len(songs), batch):
                 if job["stop"]:
                     break
-                for song, path in downloader.download_multiple_songs(songs[i : i + batch]):
-                    entry = job["songs"][song.url]
-                    if entry["status"] not in ("done", "skipped"):
-                        entry["status"] = "done" if path else "failed"
+                fetch(songs[i : i + batch])
+            missed = [s for s in songs if job["songs"][s.url]["status"] == "failed"]
+            if missed and not job["stop"]:
+                fetch(missed)  # YouTube lookups fail now and then; one retry recovers most
         if job["stop"]:
             job["status"] = "stopped"
         elif not job["songs"]:
@@ -433,7 +456,175 @@ def worker():
     resolve = lambda urls: parse_query(urls, threads=SETTINGS["threads"])  # noqa: E731
     log.info("Saving to %s as %s", Path.cwd(), SETTINGS["output"])
     while True:
-        run(pending.get(), downloader, resolve)
+        job = pending.get()
+        with library:
+            run(job, downloader, resolve)
+
+
+# --- Organize: move existing files to where OUTPUT says they belong ---------
+
+AUDIO = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".wav"}
+_tags: dict = {}  # path -> (mtime, tags), so later scans only read changed files
+
+
+def read_tags(path: Path):
+    from mutagen import File as AudioFile
+    from spotdl.utils.metadata import get_file_metadata
+
+    try:
+        meta = get_file_metadata(path) or {}
+        length = AudioFile(path).info.length
+    except Exception:  # unreadable, or not really audio
+        return {}
+    meta["has_art"] = bool(meta.pop("album_art", None))
+    meta.pop("lyrics", None)  # can be large; nothing here shows them
+    meta["ms"] = int(length * 1000)
+    return meta
+
+
+def scan(root: Path):
+    """Every audio file under root (skipping hidden/NAS system folders) with its tags."""
+    found = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if path.suffix.lower() not in AUDIO or any(p.startswith((".", "@")) for p in rel.parts):
+            continue
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        cached = _tags.get(path)
+        if not cached or cached[0] != mtime:
+            cached = _tags[path] = (mtime, read_tags(path))
+        found.append((rel, cached[1]))
+    return found
+
+
+def plan_library(root: Path):
+    """Work out each file's OUTPUT path from its tags, using spotdl's own
+    naming so a later download of the same song finds it and skips."""
+    from spotdl.types.song import Song
+    from spotdl.utils.formatter import create_file_name
+
+    plan = {"moves": [], "conflicts": [], "untagged": [], "in_place": 0}
+    claimed = set()
+    for rel, meta in scan(root):
+        if not (meta.get("name") and meta.get("artists") and meta.get("album_name")):
+            plan["untagged"].append(str(rel))
+            continue
+        fields = {**meta, "album_artist": meta.get("album_artist") or meta["artists"][0]}
+        song = Song.from_missing_data(**fields)
+        target = create_file_name(song, SETTINGS["output"], rel.suffix[1:].lower())
+        if target == rel:
+            plan["in_place"] += 1
+        elif target in claimed or (root / target).exists():
+            plan["conflicts"].append({"from": str(rel), "to": str(target)})
+        else:
+            claimed.add(target)
+            plan["moves"].append({"from": str(rel), "to": str(target)})
+    return plan
+
+
+def move_files(root: Path, moves):
+    """Move files (and same-name .lrc lyrics) without ever overwriting, then
+    remove folders the moves left empty."""
+    moved, emptied = 0, set()
+    for m in moves:
+        src, dst = root / m["from"], root / m["to"]
+        if dst.exists() or not src.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        moved += 1
+        lrc, lrc_dst = src.with_suffix(".lrc"), dst.with_suffix(".lrc")
+        if lrc.exists() and not lrc_dst.exists():
+            lrc.rename(lrc_dst)
+        emptied.add(src.parent)
+    for folder in sorted(emptied, key=lambda d: len(d.parts), reverse=True):
+        while folder != root:
+            try:
+                folder.rmdir()  # only succeeds when empty
+            except OSError:
+                break
+            folder = folder.parent
+    return moved
+
+
+@app.post("/api/organize")
+def organize(apply: bool = False):
+    if not library.acquire(blocking=False):
+        raise HTTPException(409, "Downloads are running; organize when they finish")
+    try:
+        root = Path.cwd()
+        plan = plan_library(root)
+        plan["moved"] = move_files(root, plan["moves"]) if apply else 0
+    finally:
+        library.release()
+    return {
+        **{k: v[:300] if isinstance(v, list) else v for k, v in plan.items()},
+        "counts": {k: len(v) for k, v in plan.items() if isinstance(v, list)},
+        "applied": apply,
+    }
+
+
+@app.get("/api/library")
+def library_index():
+    """Everything in the music folder, one entry per song, for the Library page."""
+    songs = []
+    for rel, meta in scan(Path.cwd()):
+        url = meta.get("url") or ""
+        songs.append(
+            {
+                "path": str(rel),
+                "id": url.rsplit("/", 1)[-1] if "open.spotify.com/track/" in url else None,
+                "name": meta.get("name") or rel.stem,
+                "artists": meta.get("artists") or [],
+                "album": meta.get("album_name") or "",
+                "album_artist": meta.get("album_artist")
+                or (meta.get("artists") or ["Unknown artist"])[0],
+                "year": meta.get("year"),
+                "track": _int(meta.get("track_number")),
+                "disc": _int(meta.get("disc_number")) or 1,
+                "ms": meta.get("ms"),
+                "art": meta.get("has_art", False),
+            }
+        )
+    return {"songs": songs}
+
+
+def _int(value):
+    try:
+        return int(str(value).split("/")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/api/library/cover")
+def library_cover(path: str):
+    """The cover art embedded in a song file."""
+    import base64
+
+    from mutagen import File as AudioFile
+    from mutagen.flac import Picture
+
+    root = Path.cwd().resolve()
+    file = (root / path).resolve()
+    if root not in file.parents or file.suffix.lower() not in AUDIO or not file.is_file():
+        raise HTTPException(404, "No such song")
+    audio, data = AudioFile(file), None
+    if hasattr(audio, "pictures") and audio.pictures:  # flac
+        data = audio.pictures[0].data
+    elif audio.tags is not None:
+        if hasattr(audio.tags, "getall") and audio.tags.getall("APIC"):  # mp3
+            data = audio.tags.getall("APIC")[0].data
+        elif audio.tags.get("covr"):  # m4a
+            data = bytes(audio.tags["covr"][0])
+        elif audio.tags.get("metadata_block_picture"):  # ogg / opus
+            data = Picture(base64.b64decode(audio.tags["metadata_block_picture"][0])).data
+    if not data:
+        raise HTTPException(404, "No cover in this file")
+    kind = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+    return Response(data, media_type=kind, headers={"Cache-Control": "max-age=86400"})
 
 
 @app.on_event("startup")

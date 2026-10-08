@@ -31,13 +31,23 @@ def check_browse():
     assert p["name"] and p["tracks"] and p["tracks"][0]["artists"]
 
 
+def song(url, name, duration=200, artist="A"):
+    return NS(url=url, name=name, artists=[artist], duration=duration, display_name=f"{artist} - {name}")
+
+
 def check_jobs():
-    songs = [NS(url=f"u{i}", name=f"Song {i}", artists=["A"], display_name=f"A - Song {i}") for i in range(3)]
+    songs = [song(f"u{i}", f"Song {i}") for i in range(3)]
+    outcome = {"u0": "x.mp3", "u1": "y.mp3", "u2": None}  # u2 fails, and fails its retry
+    calls = []
 
     def download_multiple_songs(batch):
-        app.on_progress(NS(song=batch[0], progress=100), "Skipped")
-        app.on_progress(NS(song=batch[1], progress=60), "Downloading")
-        return [(batch[0], "x.mp3"), (batch[1], "y.mp3"), (batch[2], None)]
+        calls.append([s.url for s in batch])
+        for s in batch:
+            if s.url == "u0":
+                app.on_progress(NS(song=s, progress=100), "Skipped")
+            if s.url == "u1":
+                app.on_progress(NS(song=s, progress=60), "Downloading")
+        return [(s, outcome[s.url]) for s in batch]
 
     job = client.post("/api/downloads", json={"kind": "track", "id": "abc"}).json()
     queued = client.post("/api/downloads", json={"kind": "album", "id": "def"}).json()
@@ -46,6 +56,7 @@ def check_jobs():
 
     raw = next(j for j in app.jobs if j["job"] == job["job"])
     app.run(raw, NS(download_multiple_songs=download_multiple_songs), lambda urls: songs)
+    assert calls == [["u0", "u1", "u2"], ["u2"]], calls  # one retry for the failure
     done = client.get("/api/downloads").json()
     assert len(done) == 1 and done[0]["title"] == "A - Song 0", done
     assert [s["status"] for s in done[0]["songs"]] == ["skipped", "done", "failed"]
@@ -55,12 +66,19 @@ def check_jobs():
     app.run(raw, None, lambda urls: [])  # nothing resolved -> failed with a reason
     assert raw["status"] == "failed" and raw["error"]
 
-    # a discography goes release by release; stopping it lands between batches
+    # a discography goes release by release, saves each recording once,
+    # and a stop request lands between batches
     real_urls = app.spotify_urls
     app.spotify_urls = lambda job: ["r1", "r2", "r3"]
     try:
         disco = client.post("/api/downloads", json={"kind": "artist", "id": "art", "title": "A"}).json()
         raw = next(j for j in app.jobs if j["job"] == disco["job"])
+        per_release = {
+            "r1": [song("a1", "Hit"), song("a2", "Intro", 60), song("a3", "Deep Cut")],
+            # deluxe edition: same Hit (1s longer), a different Intro, one new song
+            "r2": [song("b1", "HIT", 201), song("b2", "Intro", 95), song("b3", "B-Side")],
+            "r3": [song("c1", "Never Reached")],
+        }
         seen = []
 
         def fake_download(batch):
@@ -69,12 +87,82 @@ def check_jobs():
                 assert client.delete(f"/api/downloads/{raw['job']}").json()["stopping"]
             return [(s, "f.mp3") for s in batch]
 
-        per_release = {u: [NS(url=f"{u}-{i}", name="n", artists=["A"], display_name="A - n") for i in range(3)] for u in ("r1", "r2", "r3")}
         app.run(raw, NS(download_multiple_songs=fake_download), lambda urls: per_release[urls[0]], batch=2)
-        assert seen == [["r1-0", "r1-1"], ["r1-2"], ["r2-0", "r2-1"]], seen
+        assert seen == [["a1", "a2"], ["a3"], ["b2", "b3"]], seen
+        status = {url: s["status"] for url, s in raw["songs"].items()}
+        assert status["b1"] == "duplicate" and status["b2"] == status["b3"] == "done", status
         assert (raw["status"], raw["step"], raw["steps"], len(raw["songs"])) == ("stopped", 2, 3, 6)
     finally:
         app.spotify_urls = real_urls
+
+
+def check_organize_and_library():
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import APIC, ID3
+
+    root = Path(tempfile.mkdtemp())
+    silence = root / "silence.mp3"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                    "-t", "1", "-q:a", "9", str(silence)], check=True)
+    png = b"\x89PNG\r\n\x1a\nfake"
+
+    def tagged(rel, title, track, cover=False):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(silence, path)
+        tags = EasyID3()
+        tags.update({"title": title, "artist": "Radiohead", "albumartist": "Radiohead",
+                     "album": "OK Computer", "tracknumber": f"{track}/12"})
+        tags.save(path)
+        if cover:
+            id3 = ID3(path)
+            id3.add(APIC(encoding=3, mime="image/png", type=3, desc="Cover", data=png))
+            id3.save()
+
+    tagged("Radiohead - Airbag.mp3", "Airbag", 1, cover=True)  # flat spotdl layout
+    (root / "Radiohead - Airbag.lrc").write_text("[00:01.00]lyrics")
+    tagged("old/Radiohead - Lucky.mp3", "Lucky", 11)  # its folder empties out
+    tagged("Radiohead/OK Computer/03 - Subterranean Homesick Alien.mp3", "Subterranean Homesick Alien", 3)
+    tagged("dupe/Radiohead - Airbag.mp3", "Airbag", 1)  # wants the same spot as the first
+    silence.rename(root / "untagged.mp3")
+    here = os.getcwd()
+    os.chdir(root)
+    try:
+        preview = client.post("/api/organize").json()
+        assert preview["counts"] == {"moves": 2, "conflicts": 1, "untagged": 1}, preview
+        assert preview["in_place"] == 1 and not preview["applied"]
+        assert (root / "Radiohead - Airbag.mp3").exists()  # a preview moves nothing
+
+        assert client.post("/api/organize", params={"apply": True}).json()["moved"] == 2
+        album = root / "Radiohead" / "OK Computer"
+        assert sorted(p.name for p in album.iterdir()) == [
+            "01 - Airbag.lrc", "01 - Airbag.mp3", "03 - Subterranean Homesick Alien.mp3", "11 - Lucky.mp3"]
+        assert not (root / "old").exists()
+        assert (root / "dupe" / "Radiohead - Airbag.mp3").exists() and (root / "untagged.mp3").exists()
+        again = client.post("/api/organize").json()
+        assert again["counts"]["moves"] == 0 and again["in_place"] == 3
+
+        songs = client.get("/api/library").json()["songs"]
+        assert len(songs) == 5, songs
+        airbag = next(s for s in songs if s["path"] == "Radiohead/OK Computer/01 - Airbag.mp3")
+        assert (airbag["track"], airbag["album"], airbag["art"]) == (1, "OK Computer", True), airbag
+        cover = client.get("/api/library/cover", params={"path": airbag["path"]})
+        assert cover.content == png and cover.headers["content-type"] == "image/png"
+        assert client.get("/api/library/cover", params={"path": "untagged.mp3"}).status_code == 404
+        assert client.get("/api/library/cover", params={"path": "../../etc/passwd"}).status_code == 404
+
+        app.library.acquire()  # a download is running
+        assert client.post("/api/organize", params={"apply": True}).status_code == 409
+        app.library.release()
+    finally:
+        os.chdir(here)
+        shutil.rmtree(root)
 
 
 def check_home():
@@ -85,6 +173,7 @@ def check_home():
 if __name__ == "__main__":
     check_links()
     check_jobs()
+    check_organize_and_library()
     check_browse()
     check_home()
     print("ok")
