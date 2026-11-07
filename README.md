@@ -39,7 +39,7 @@ All optional. Set them under `environment:`.
 | `PORT`    | `8800` | The port the web UI listens on |
 | `SYNC_HOURS` | `24` | How often saved playlists re-sync. `0` turns it off. |
 | `YT_DLP_ARGS` | `--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8` | Extra [yt-dlp options](https://github.com/yt-dlp/yt-dlp#usage-and-options) for every download. The default paces requests to YouTube; set it empty to go full speed. |
-| `UPDATE_HOURS` | `24` | How often yt-dlp is updated while running (it's also updated on every start). `0` turns it off. |
+| `UPDATE_HOURS` | `24` | How often yt-dlp is updated while running (it's also updated on every start). `0` turns both off, for a yt-dlp you manage yourself. |
 | `JELLYFIN_URL` | | For example `http://192.168.1.10:8096`. With `JELLYFIN_API_KEY`, playlists are created in Jellyfin directly. |
 | `JELLYFIN_API_KEY` | | Jellyfin → Dashboard → API Keys → + |
 | `JELLYFIN_USER` | first admin | Whose account the playlists belong to |
