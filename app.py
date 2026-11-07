@@ -70,6 +70,10 @@ LIMITED = re.compile(r"rate.?limit|HTTP Error 429|Too Many Requests|confirm you.
 
 class YouTubeLimited(Exception):
     """YouTube is refusing this server for a while; downloads wait instead of all failing."""
+
+
+class YouTubeBroken(Exception):
+    """YouTube changed something and yt-dlp is being updated; downloads wait for it instead of failing."""
 LINK = re.compile(
     r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?|spotify:)"
     r"(track|album|artist|playlist)[/:]([A-Za-z0-9]+)"
@@ -414,6 +418,7 @@ def save():
 def reset(job):
     job.update(status="queued", step=0, steps=0, current=0, stop=False, error=None, songs={})
     job.pop("min_wait", None)
+    job.pop("heals", None)
 
 
 def restore():
@@ -563,7 +568,8 @@ def on_progress(tracker, message):
         if message == "Error":
             failure = getattr(tracker, "failure", None)
             song["error"] = reason(failure)
-            heal_soon(f"{failure} {getattr(failure, '__cause__', '') or ''}")
+            if heal_soon(f"{failure} {getattr(failure, '__cause__', '') or ''}"):
+                song["broken"] = True  # the job waits for the new yt-dlp (stop_if_limited)
 
 
 # spotdl only tells the progress callback "Error"; keep the exception so the
@@ -752,6 +758,10 @@ def run(job, downloader, resolve, batch=None):
     except YouTubeLimited as exc:  # YouTube says "for up to an hour": wait, then carry on
         log.warning("download %s waiting: YouTube is rate-limiting this server (%s)", job["job"], exc)
         job["status"], job["error"], job["min_wait"] = "waiting", "YouTube is rate-limiting this server, so downloads are paused", 15 * 60
+    except YouTubeBroken as exc:  # the restart that loads the new yt-dlp picks it back up (or an hour passes)
+        log.warning("download %s waiting: YouTube changed something (%s)", job["job"], exc)
+        job["heals"] = job.get("heals", 0) + 1
+        job["status"], job["error"], job["min_wait"] = "waiting", "YouTube changed something; waiting for a yt-dlp update", HEAL_EVERY
     except Exception as exc:  # keep the worker alive; show the reason in the UI
         log.exception("download %s failed", job["job"])
         job["status"], job["error"] = "failed", why(exc)
@@ -761,19 +771,25 @@ def run(job, downloader, resolve, batch=None):
 
 
 def stop_if_limited(job, batch, release):
-    """If YouTube refused any of `batch` because it's limiting this server, forget
-    every song of this release that isn't saved yet (so the next try, after the
-    wait, fetches them all again) and stop here."""
-    if any(LIMITED.search(job["songs"][s.url].get("error") or "") for s in batch):
+    """If YouTube refused any of `batch` because it's limiting this server (or a song failed
+    because YouTube changed something, at most MAX_HEALS times a job), forget every song of
+    this release that isn't saved yet (so the next try, after the wait, fetches them all
+    again) and stop here."""
+    songs = [job["songs"][s.url] for s in batch]
+    limited = any(LIMITED.search(s.get("error") or "") for s in songs)
+    broken = job.get("heals", 0) < MAX_HEALS and any(s.get("broken") and s["status"] == "failed" for s in songs)
+    if limited or broken:
         forget = {s.url for s in release if job["songs"][s.url]["status"] not in ("done", "skipped")}
         job["songs"] = {url: s for url, s in job["songs"].items() if url not in forget}
-        raise YouTubeLimited(f"{len(forget)} songs to fetch again")
+        raise (YouTubeLimited if limited else YouTubeBroken)(f"{len(forget)} songs to fetch again")
 
 
-def work(job, downloader, resolve, sleep=time.sleep):
+def work(job, downloader, resolve, sleep=None):
     """Run a job. While Spotify can't be reached or YouTube is limiting us, keep
     it waiting and try again, backing off to every 30 min (YouTube: at least 15),
-    instead of failing it and everything after it. Songs already saved are skipped."""
+    instead of failing it and everything after it. Songs already saved are skipped.
+    A new yt-dlp to load ends the wait early: the job stays waiting, and the restart
+    picks it back up."""
     wait = 60
     while True:
         with library:
@@ -783,7 +799,9 @@ def work(job, downloader, resolve, sleep=time.sleep):
         delay = max(wait, job.pop("min_wait", 0))
         job["error"] += f". Trying again in {delay // 60} min."
         save()
-        sleep(delay)
+        (sleep or restart_wanted.wait)(delay)
+        if restart_wanted.is_set():
+            return
         with lock:
             if job["status"] != "waiting":  # removed while it waited
                 return
@@ -874,6 +892,9 @@ def worker():
             maybe_update()
         if restart_wanted.is_set() and not others_busy():
             restart()
+        if healing.is_set():  # yt-dlp is being replaced: no new download until it's done
+            time.sleep(IDLE_POLL)
+            continue
         try:
             job = pending.get(timeout=60)[2]
         except queue.Empty:
@@ -919,11 +940,16 @@ def maybe_update():
 # When YouTube changes something, downloads fail with errors like these (not rate limits, not one
 # missing video), and yt-dlp usually has a fix within hours: get it now instead of at the daily check.
 BROKEN = re.compile(r"unable to extract|nsig extraction failed|signature extraction failed|n challenge|"
-                    r"requested format is not available|no video formats found|player response|unable to download (api|webpage)|"
+                    r"requested format is not available|no video formats found|player response|unable to download api page: http error 400|"
                     r"not available on this app|page needs to be reloaded|only images are available", re.I)
 HEAL = os.environ.get("HEAL", "1") != "0"  # HEAL=0: only the start-up and UPDATE_HOURS updates
 HEAL_EVERY = 3600
 HEALED = Path(".music-findr/healed")  # touched at each heal, so the hourly cap survives the restart
+MAX_HEALS = 3  # a download waits for a new yt-dlp at most this often, then fails as before
+IDLE_WAIT, IDLE_POLL = 30 * 60, 5  # pip waits up to IDLE_WAIT for running downloads to finish
+# pip errors that won't go away by themselves; anything else (no network for a while) is tried again next hour
+STUCK = re.compile(r"permission denied|read-only file system|externally.managed|no module named pip", re.I)
+healing = threading.Event()  # set while yt-dlp is being replaced: no new downloads start
 _healed = 0.0
 _heal_lock = threading.Lock()
 
@@ -953,13 +979,22 @@ def heal(why: str) -> bool:
             HEALED.touch()
         except OSError:
             pass
-    log.warning("yt-dlp looks out of date (%s); updating it now", (why or "").strip()[:160])
+    log.warning("yt-dlp looks out of date (%s); updating it once downloads pause", (why or "").strip()[:160])
+    healing.set()
     try:
+        idle_by = time.time() + IDLE_WAIT
+        while (active or others_busy()) and time.time() < idle_by:  # never swap yt-dlp under a running download
+            time.sleep(IDLE_POLL)
         if update_ytdlp() or update_ytdlp(pre=True):
             restart_wanted.set()
-    except Exception as exc:  # pip can't write here (read-only image, no network): say so once, then stop
-        HEAL = False
-        log.warning("couldn't update yt-dlp (%s); not trying again until a restart", exc)
+    except Exception as exc:
+        if STUCK.search(str(exc)):  # pip can't write here (a read-only image): say so once, then stop
+            HEAL = False
+            log.warning("couldn't update yt-dlp (%s); not trying again until a restart", exc)
+        else:
+            log.warning("couldn't update yt-dlp (%s); trying again on the next failure after an hour", exc)
+    finally:
+        healing.clear()
     return True
 
 

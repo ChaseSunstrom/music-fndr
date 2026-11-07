@@ -193,9 +193,10 @@ def check_ytdlp_auto_update():
 def check_heal_when_youtube_changes():
     """A failure that means YouTube changed updates yt-dlp at once, nightly if stable has nothing
     newer, at most hourly; rate limits and removed videos don't."""
-    real = app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL
+    real = app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL, app.others_busy, app.IDLE_POLL
     tried = []
     try:
+        app.IDLE_POLL = 0
         app.HEALED = Path(tempfile.mkdtemp()) / "healed"
         app.UPDATE_HOURS, app._healed = 24, 0.0
         app.update_ytdlp = lambda pre=False: tried.append(pre) or pre  # stable: nothing newer; nightly: newer
@@ -213,12 +214,21 @@ def check_heal_when_youtube_changes():
                             ("ERROR: [youtube] abc: The following content is not available on this app.", True),
                             ("ERROR: [youtube] abc: The page needs to be reloaded.. The page needs to be reloaded.", True),
                             ("ERROR: [youtube] abc: This content isn't available, try again later. "
-                             "The current session has been rate-limited by YouTube for up to an hour.", False)]:
+                             "The current session has been rate-limited by YouTube for up to an hour.", False),
+                            ("ERROR: [youtube] abc: Unable to download API page: HTTP Error 400: Bad Request", True),
+                            # a mistyped handle, or no network: not YouTube changing anything
+                            ("ERROR: [youtube:tab] @nosuch: Unable to download webpage: HTTP Error 404: Not Found", False),
+                            ("ERROR: [youtube] abc: Unable to download webpage: <urlopen error [Errno -3] "
+                             "Temporary failure in name resolution>", False)]:
             assert app.looks_broken(why) is broken, why
         assert not app.heal("ERROR: [youtube] abc: Video unavailable. This video has been removed")
         assert not app.heal("HTTP Error 429: Too Many Requests")
+        busy = iter([True, True, False])
+        app.others_busy = lambda: next(busy)  # a video is downloading: pip waits for it
         assert app.heal("ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing")
         assert tried == [False, True] and app.restart_wanted.is_set(), tried
+        assert not app.healing.is_set(), "new downloads are held only while pip runs"
+        app.others_busy = lambda: False
         assert not app.heal("Requested format is not available"), "at most once an hour"
         app._healed = 0.0  # a restart forgets; the file remembers
         assert not app.heal("Requested format is not available"), "the cap survives a restart"
@@ -238,11 +248,72 @@ def check_heal_when_youtube_changes():
         app._healed = 0.0
         assert not app.heal("nsig extraction failed") and tried.count("pip") == 1, "and doesn't try again"
         app.HEAL = True
+
+        def offline(pre=False):
+            raise RuntimeError("Could not fetch URL https://pypi.org/simple/yt-dlp/: connection timed out")
+        app.update_ytdlp, app._healed = offline, 0.0
+        os.utime(app.HEALED, (0, 0))
+        assert app.heal("nsig extraction failed") and app.HEAL, "no network for a while doesn't turn healing off"
         app.UPDATE_HOURS = 0
         assert not app.heal("nsig extraction failed"), "UPDATE_HOURS=0 turns it off"
     finally:
-        app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL = real
+        app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL, app.others_busy, app.IDLE_POLL = real
         app.restart_wanted.clear()
+
+
+def check_songs_wait_for_a_new_ytdlp():
+    """Songs that fail because YouTube changed something make the download wait (and the
+    restart that loads the new yt-dlp picks it back up) instead of failing, at most MAX_HEALS times."""
+    broken = [True]
+
+    def download_multiple_songs(batch):
+        out = []
+        for s in batch:
+            if broken[0] and s.url == "b2":
+                app.on_progress(NS(song=s, progress=0, failure=RuntimeError("nsig extraction failed")), "Error")
+                out.append((s, None))
+            else:
+                out.append((s, "ok.mp3"))
+        return out
+
+    real = app.heal_soon, app.run
+    app.heal_soon = lambda why: "nsig" in why
+    app.run = lambda job, d, r: real[1](job, d, r, batch=1)
+    tracks = [song("b1", "First"), song("b2", "Second"), song("b3", "Third")]
+    jobs = []
+    try:
+        def start(name):
+            job = client.post("/api/downloads", json={"kind": "album", "id": name}).json()
+            assert "job" in job, job
+            jobs.append(next(j for j in app.jobs if j["job"] == job["job"]))
+            return jobs[-1]
+
+        raw, waits = start("broken"), []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            broken[0] = False  # the new yt-dlp works
+        app.work(raw, NS(download_multiple_songs=download_multiple_songs), lambda urls: tracks, sleep=sleep)
+        assert waits == [app.HEAL_EVERY] and raw["status"] == "done", (waits, raw)
+        assert {s["status"] for s in raw["songs"].values()} == {"done"}, raw
+
+        broken[0] = True
+        raw = start("restart")
+        app.work(raw, NS(download_multiple_songs=download_multiple_songs), lambda urls: tracks,
+                 sleep=lambda s: app.restart_wanted.set())
+        assert raw["status"] == "waiting" and app.RUNNING.count("waiting"), "left for the restart to pick up"
+        app.restart_wanted.clear()
+
+        raw = start("gaveup")
+        raw["heals"] = app.MAX_HEALS
+        app.work(raw, NS(download_multiple_songs=download_multiple_songs), lambda urls: tracks, sleep=sleep)
+        assert raw["status"] == "done" and raw["songs"]["b2"]["status"] == "failed", raw
+    finally:
+        app.heal_soon, app.run = real
+        app.restart_wanted.clear()
+        with app.lock:
+            for j in jobs:
+                app.jobs.remove(j)
 
 
 def check_links():
@@ -772,6 +843,7 @@ if __name__ == "__main__":
     check_youtube_rate_limit_pauses()
     check_ytdlp_auto_update()
     check_heal_when_youtube_changes()
+    check_songs_wait_for_a_new_ytdlp()
     check_discographies_wait_their_turn()
     check_links()
     check_cross_site_guard()
