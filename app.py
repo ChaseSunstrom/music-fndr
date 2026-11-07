@@ -919,7 +919,8 @@ def maybe_update():
 # When YouTube changes something, downloads fail with errors like these (not rate limits, not one
 # missing video), and yt-dlp usually has a fix within hours: get it now instead of at the daily check.
 BROKEN = re.compile(r"unable to extract|nsig extraction failed|signature extraction failed|n challenge|"
-                    r"requested format is not available|no video formats found|player response|unable to download (api|webpage)", re.I)
+                    r"requested format is not available|no video formats found|player response|unable to download (api|webpage)|"
+                    r"not available on this app|page needs to be reloaded|only images are available", re.I)
 HEAL = os.environ.get("HEAL", "1") != "0"  # HEAL=0: only the start-up and UPDATE_HOURS updates
 HEAL_EVERY = 3600
 HEALED = Path(".music-findr/healed")  # touched at each heal, so the hourly cap survives the restart

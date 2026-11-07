@@ -208,7 +208,12 @@ def check_heal_when_youtube_changes():
                             ("ERROR: [youtube] abc: Requested format is not available", True),
                             ("ERROR: [youtube] abc: Unable to extract yt initial data", True),
                             ("ERROR: [youtube] abc: Failed to extract any player response", True),
-                            ("ERROR: [youtube] abc: No video formats found!", True)]:
+                            ("ERROR: [youtube] abc: No video formats found!", True),
+                            # what a 2025.06 and a 2025.09 yt-dlp said in November 2026
+                            ("ERROR: [youtube] abc: The following content is not available on this app.", True),
+                            ("ERROR: [youtube] abc: The page needs to be reloaded.. The page needs to be reloaded.", True),
+                            ("ERROR: [youtube] abc: This content isn't available, try again later. "
+                             "The current session has been rate-limited by YouTube for up to an hour.", False)]:
             assert app.looks_broken(why) is broken, why
         assert not app.heal("ERROR: [youtube] abc: Video unavailable. This video has been removed")
         assert not app.heal("HTTP Error 429: Too Many Requests")
