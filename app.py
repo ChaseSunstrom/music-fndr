@@ -561,7 +561,9 @@ def on_progress(tracker, message):
             status=SONG_STATUS.get(message, "downloading"),
         )
         if message == "Error":
-            song["error"] = reason(getattr(tracker, "failure", None))
+            failure = getattr(tracker, "failure", None)
+            song["error"] = reason(failure)
+            heal_soon(f"{failure} {getattr(failure, '__cause__', '') or ''}")
 
 
 # spotdl only tells the progress callback "Error"; keep the exception so the
@@ -891,11 +893,11 @@ restart_wanted = threading.Event()
 others_busy = lambda: False  # noqa: E731  (an app embedding this one can say its own downloads are running)
 
 
-def update_ytdlp() -> bool:
-    """Install the newest yt-dlp; True when the version changed."""
+def update_ytdlp(pre=False) -> bool:
+    """Install the newest yt-dlp (pre: its nightly build); True when the version changed."""
     before = version("yt-dlp")
     cmd = [sys.executable, "-m", "pip", "install", "-q", "-U", "--no-cache-dir", "--disable-pip-version-check",
-           "--timeout", "15", "--retries", "2", "yt-dlp[default]"]
+           "--timeout", "15", "--retries", "2", *(["--pre"] if pre else []), "yt-dlp[default]"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode:
         log.warning("couldn't update yt-dlp: %s", (r.stderr or r.stdout)[-300:])
@@ -912,6 +914,41 @@ def maybe_update():
             restart_wanted.set()
     except Exception:
         log.exception("yt-dlp update check failed")
+
+
+# When YouTube changes something, downloads fail with errors like these (not rate limits, not one
+# missing video), and yt-dlp usually has a fix within hours: get it now instead of at the daily check.
+BROKEN = re.compile(r"unable to extract|nsig extraction failed|signature extraction failed|n challenge|"
+                    r"requested format is not available|no video formats found|player response|unable to download (api|webpage)", re.I)
+HEAL_EVERY = 3600
+_healed = 0.0
+_heal_lock = threading.Lock()
+
+
+def heal(why: str) -> bool:
+    """YouTube seems to have changed: update yt-dlp now (at most hourly), to the nightly build
+    when the stable one has nothing newer, and restart between downloads to load it.
+    True when an update was tried. Embedding apps call it for their own yt-dlp failures."""
+    global _healed
+    if UPDATE_HOURS <= 0 or not BROKEN.search(why or "") or LIMITED.search(why or ""):
+        return False
+    with _heal_lock:
+        if time.time() - _healed < HEAL_EVERY:
+            return False
+        _healed = time.time()
+    log.warning("yt-dlp looks out of date (%s); updating it now", (why or "").strip()[:160])
+    try:
+        if update_ytdlp() or update_ytdlp(pre=True):
+            restart_wanted.set()
+    except Exception:
+        log.exception("yt-dlp update failed")
+    return True
+
+
+def heal_soon(why: str):
+    """heal() without holding up the download that failed (pip can take a while)."""
+    if UPDATE_HOURS > 0 and BROKEN.search(why or ""):
+        threading.Thread(target=heal, args=(why,), daemon=True, name="yt-dlp-heal").start()
 
 
 def restart():

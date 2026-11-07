@@ -189,6 +189,29 @@ def check_ytdlp_auto_update():
     assert "azlyrics" not in app.SETTINGS["lyrics_providers"]
 
 
+def check_heal_when_youtube_changes():
+    """A failure that means YouTube changed updates yt-dlp at once, nightly if stable has nothing
+    newer, at most hourly; rate limits and removed videos don't."""
+    real = app.update_ytdlp, app.UPDATE_HOURS, app._healed
+    tried = []
+    try:
+        app.UPDATE_HOURS, app._healed = 24, 0.0
+        app.update_ytdlp = lambda pre=False: tried.append(pre) or pre  # stable: nothing newer; nightly: newer
+        assert not app.heal("ERROR: [youtube] abc: Video unavailable. This video has been removed")
+        assert not app.heal("HTTP Error 429: Too Many Requests")
+        assert app.heal("ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing")
+        assert tried == [False, True] and app.restart_wanted.is_set(), tried
+        assert not app.heal("Requested format is not available"), "at most once an hour"
+        app._healed = time.time() - 3700
+        assert app.heal("Requested format is not available")
+        app.UPDATE_HOURS = 0
+        app._healed = 0.0
+        assert not app.heal("nsig extraction failed"), "UPDATE_HOURS=0 turns it off"
+    finally:
+        app.update_ytdlp, app.UPDATE_HOURS, app._healed = real
+        app.restart_wanted.clear()
+
+
 def check_links():
     for q, want in [
         ("https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE?si=x", ("album", "6dVIqQ8qmQ5GBnJ9shOYGE")),
@@ -715,6 +738,7 @@ if __name__ == "__main__":
     check_hung_batch_is_cut_off()
     check_youtube_rate_limit_pauses()
     check_ytdlp_auto_update()
+    check_heal_when_youtube_changes()
     check_discographies_wait_their_turn()
     check_links()
     check_cross_site_guard()

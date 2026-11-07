@@ -75,7 +75,7 @@ Spotify lookups use the same anonymous access as the Spotify web player, so ther
 
 ## Updating
 
-YouTube changes often, and a yt-dlp a few weeks old starts failing downloads. The container updates yt-dlp every time it starts and checks again every `UPDATE_HOURS`; when there's a new one it restarts between downloads to load it (the queue carries on). To update everything else, rebuild:
+YouTube changes often, and a yt-dlp a few weeks old starts failing downloads. The container updates yt-dlp every time it starts and checks again every `UPDATE_HOURS`; when there's a new one it restarts between downloads to load it (the queue carries on). When downloads fail in a way that means YouTube changed something, it updates straight away (at most once an hour), to yt-dlp's nightly build if the regular release has no fix yet. To update everything else, rebuild:
 
 ```sh
 docker compose build --pull --no-cache && docker compose up -d
