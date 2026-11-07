@@ -38,6 +38,8 @@ All optional. Set them under `environment:`.
 | `THREADS` | `4` | How many songs download at the same time |
 | `PORT`    | `8800` | The port the web UI listens on |
 | `SYNC_HOURS` | `24` | How often saved playlists re-sync. `0` turns it off. |
+| `YT_DLP_ARGS` | `--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8` | Extra [yt-dlp options](https://github.com/yt-dlp/yt-dlp#usage-and-options) for every download. The default paces requests to YouTube; set it empty to go full speed. |
+| `UPDATE_HOURS` | `24` | How often yt-dlp is updated while running (it's also updated on every start). `0` turns it off. |
 | `JELLYFIN_URL` | | For example `http://192.168.1.10:8096`. With `JELLYFIN_API_KEY`, playlists are created in Jellyfin directly. |
 | `JELLYFIN_API_KEY` | | Jellyfin → Dashboard → API Keys → + |
 | `JELLYFIN_USER` | first admin | Whose account the playlists belong to |
@@ -46,7 +48,8 @@ All optional. Set them under `environment:`.
 
 - **Already have it:** songs already in the folder are skipped, so downloading an album twice is safe.
 - **Discography** downloads every album and single, one release at a time. Compilations are left out. When the same recording turns up on several releases (single and album, clean and explicit, deluxe), it's saved once.
-- **Couldn't download:** each song that fails gets one automatic retry. **Retry** on a finished download runs it again, and only what's missing downloads.
+- **Couldn't download:** each song that fails gets one automatic retry. The Downloads panel says why it failed (not on YouTube Music, YouTube's own error, or it took too long). **Retry** on a finished download runs it again, and only what's missing downloads.
+- **Stuck songs:** a batch of songs that takes over 30 minutes (a site that stopped answering) is cut off, and the queue carries on with a fresh downloader, so one stuck song can't stop everything.
 - **Restarts:** the queue is saved in `/music/.music-findr/`. After a restart or crash, anything that was waiting or running starts again, and songs that were cut off mid-write are cleaned up first.
 - **Stop** ends a running download after the songs in progress.
 - **Order:** songs, albums and playlists you add run before queued artist discographies, which can take hours.
@@ -68,11 +71,11 @@ Download a Spotify playlist and it's saved on the **Playlists** page and re-sync
 
 ## Rate limits
 
-Spotify lookups use the same anonymous access as the Spotify web player, so there's no API key to get banned, but Spotify does limit how fast one server can look things up. When it does (or can't be reached), downloads show "Can't reach Spotify" and wait, retrying after 1, 2, 4… up to 30 minutes, instead of failing. Audio comes from YouTube, which can also slow down or block heavy use; if many songs show "Couldn't download", lower `THREADS` and use **Retry failed** later.
+Spotify lookups use the same anonymous access as the Spotify web player, so there's no API key to get banned, but Spotify does limit how fast one server can look things up. When it does (or can't be reached), downloads show "Can't reach Spotify" and wait, retrying after 1, 2, 4… up to 30 minutes, instead of failing. Audio comes from YouTube, which allows one server roughly 300 songs an hour. Past that it refuses everything "for up to an hour", which used to make every song after that point fail. Now the download shows "YouTube is rate-limiting this server", waits 15 minutes (longer if it's still refused), and carries on where it stopped; songs already saved aren't fetched again. A short pause between YouTube requests (`YT_DLP_ARGS`) keeps big downloads under the limit more often. If you still hit it a lot, lower `THREADS`.
 
 ## Updating
 
-YouTube changes often, and the fix is usually a newer yt-dlp. Rebuild to pick it up:
+YouTube changes often, and a yt-dlp a few weeks old starts failing downloads. The container updates yt-dlp every time it starts and checks again every `UPDATE_HOURS`; when there's a new one it restarts between downloads to load it (the queue carries on). To update everything else, rebuild:
 
 ```sh
 docker compose build --pull --no-cache && docker compose up -d

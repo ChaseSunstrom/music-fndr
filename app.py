@@ -4,6 +4,7 @@ Files land relative to the working directory (/music in the container),
 exactly like `spotdl web --web-use-output-dir`.
 """
 
+import asyncio
 import base64
 import hashlib
 import itertools
@@ -19,6 +20,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Optional
+
+import subprocess
+import sys
+from importlib.metadata import version
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -36,6 +41,7 @@ from spotapi.http.request import TLSClient
 # deadlocks (it once killed the download worker at startup), so all of it loads
 # here, before any thread starts.
 from spotdl.download.downloader import Downloader
+from spotdl.download.progress_handler import SongTracker
 from spotdl.types.song import Song as SpotdlSong
 from spotdl.utils.formatter import create_file_name, sanitize_string
 from spotdl.utils.metadata import get_file_metadata
@@ -50,7 +56,20 @@ SETTINGS = {
     "bitrate": os.environ.get("BITRATE", "128k"),
     "threads": int(os.environ.get("THREADS", "4")),
     "simple_tui": True,
+    # spotdl's default list also has azlyrics, whose requests have no timeout:
+    # when the site stops answering, the song (and the whole queue) waits forever
+    "lyrics_providers": ["genius", "musixmatch"],
+    # YouTube rate-limits a server that fetches too many songs too fast (about
+    # 300 an hour), and then refuses everything for up to an hour. A short pause
+    # between requests keeps big downloads under that more often.
+    "yt_dlp_args": os.environ.get("YT_DLP_ARGS", "--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8"),
 }
+# in yt-dlp's message when YouTube is limiting this server
+LIMITED = re.compile(r"rate.?limit|HTTP Error 429|Too Many Requests|confirm you.?re not a bot", re.I)
+
+
+class YouTubeLimited(Exception):
+    """YouTube is refusing this server for a while; downloads wait instead of all failing."""
 LINK = re.compile(
     r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?|spotify:)"
     r"(track|album|artist|playlist)[/:]([A-Za-z0-9]+)"
@@ -394,6 +413,7 @@ def save():
 
 def reset(job):
     job.update(status="queued", step=0, steps=0, current=0, stop=False, error=None, songs={})
+    job.pop("min_wait", None)
 
 
 def restore():
@@ -540,6 +560,42 @@ def on_progress(tracker, message):
             message=message,
             status=SONG_STATUS.get(message, "downloading"),
         )
+        if message == "Error":
+            song["error"] = reason(getattr(tracker, "failure", None))
+
+
+# spotdl only tells the progress callback "Error"; keep the exception so the
+# Downloads panel can say why a song failed
+_notify_error = SongTracker.notify_error
+
+
+def _keep_failure(self, message, traceback, finish=False):
+    self.failure = traceback  # set before notify_error fires the callback
+    _notify_error(self, message, traceback, finish)
+
+
+SongTracker.notify_error = _keep_failure
+
+
+def reason(exc) -> str:
+    """A short, plain reason a song couldn't download."""
+    if exc is None:
+        return "Couldn't download"
+    text = str(exc)
+    if LIMITED.search(f"{text} {exc.__cause__ or ''}"):
+        return "YouTube is rate-limiting this server"
+    if isinstance(exc, LookupError) or "No results found" in text:
+        return "Not found on YouTube Music"
+    if type(exc).__name__ == "AudioProviderError":
+        # spotdl wraps yt-dlp's message ("YT-DLP download error - <url>"); show yt-dlp's own
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        detail = re.sub(r"^(ERROR:\s*)?(\[[\w:]+\]\s*)?([\w-]{11}:\s*)?", "", str(cause)).split("\n")[0].strip()
+        if not detail or detail.startswith("YT-DLP download error"):
+            return "YouTube wouldn't send it (often rate limiting; Retry later)"
+        return f"YouTube: {detail}"[:200]
+    if isinstance(exc, TimeoutError):
+        return "Took too long and was cut off"
+    return f"{type(exc).__name__}: {text}"[:160]
 
 
 def target(song):
@@ -605,11 +661,23 @@ def run(job, downloader, resolve, batch=None):
         seen.setdefault(key, []).append(song.duration)
         return False
 
+    timed_out = set()  # not retried: a song that hung once tends to hang again
+
     def fetch(batch_songs):
-        for song, path in downloader.download_multiple_songs(batch_songs):
+        try:
+            results = downloader.download_multiple_songs(batch_songs)
+        except TimeoutError as exc:  # a song hung; the downloader was replaced
+            results = [(s, None) for s in batch_songs]
+            for s in batch_songs:
+                if job["songs"][s.url]["status"] not in ("done", "skipped"):
+                    job["songs"][s.url]["error"] = reason(exc)
+                    timed_out.add(s.url)
+        for song, path in results:
             entry = job["songs"][song.url]
             if entry["status"] not in ("done", "skipped"):
                 entry["status"] = "done" if path else "failed"
+            if entry["status"] in ("done", "skipped"):
+                entry.pop("error", None)  # the retry worked
 
     try:
         urls = spotify_urls(job)
@@ -660,9 +728,11 @@ def run(job, downloader, resolve, batch=None):
                     break
                 fetch(songs[i : i + batch])
                 save()
-            missed = [s for s in songs if job["songs"][s.url]["status"] == "failed"]
+                stop_if_limited(job, songs[i : i + batch], songs)
+            missed = [s for s in songs if job["songs"][s.url]["status"] == "failed" and s.url not in timed_out]
             if missed and not job["stop"]:
                 fetch(missed)  # YouTube lookups fail now and then; one retry recovers most
+                stop_if_limited(job, missed, songs)
         if job["stop"]:
             job["status"] = "stopped"
         elif not job["songs"]:
@@ -677,6 +747,9 @@ def run(job, downloader, resolve, batch=None):
     except (RequestError, BaseClientError) as exc:  # Spotify unreachable or limiting: work() waits
         log.warning("download %s waiting: %s", job["job"], why(exc))
         job["status"], job["error"] = "waiting", f"Can't reach Spotify: {why(exc)}"
+    except YouTubeLimited as exc:  # YouTube says "for up to an hour": wait, then carry on
+        log.warning("download %s waiting: YouTube is rate-limiting this server (%s)", job["job"], exc)
+        job["status"], job["error"], job["min_wait"] = "waiting", "YouTube is rate-limiting this server, so downloads are paused", 15 * 60
     except Exception as exc:  # keep the worker alive; show the reason in the UI
         log.exception("download %s failed", job["job"])
         job["status"], job["error"] = "failed", why(exc)
@@ -685,18 +758,30 @@ def run(job, downloader, resolve, batch=None):
         save()
 
 
+def stop_if_limited(job, batch, release):
+    """If YouTube refused any of `batch` because it's limiting this server, forget
+    every song of this release that isn't saved yet (so the next try, after the
+    wait, fetches them all again) and stop here."""
+    if any(LIMITED.search(job["songs"][s.url].get("error") or "") for s in batch):
+        forget = {s.url for s in release if job["songs"][s.url]["status"] not in ("done", "skipped")}
+        job["songs"] = {url: s for url, s in job["songs"].items() if url not in forget}
+        raise YouTubeLimited(f"{len(forget)} songs to fetch again")
+
+
 def work(job, downloader, resolve, sleep=time.sleep):
-    """Run a job. While Spotify can't be reached, keep it waiting and try again,
-    backing off to every 30 min, instead of failing it and everything after it."""
+    """Run a job. While Spotify can't be reached or YouTube is limiting us, keep
+    it waiting and try again, backing off to every 30 min (YouTube: at least 15),
+    instead of failing it and everything after it. Songs already saved are skipped."""
     wait = 60
     while True:
         with library:
             run(job, downloader, resolve)
         if job["status"] != "waiting":
             return
-        job["error"] += f". Trying again in {wait // 60} min."
+        delay = max(wait, job.pop("min_wait", 0))
+        job["error"] += f". Trying again in {delay // 60} min."
         save()
-        sleep(wait)
+        sleep(delay)
         with lock:
             if job["status"] != "waiting":  # removed while it waited
                 return
@@ -714,21 +799,124 @@ def serve_one(job, downloader, resolve):
         save()
 
 
+BATCH_LIMIT = 30 * 60  # seconds one batch of songs may take before it's cut off
+
+
+class Watched:
+    """spotdl's Downloader with a time limit on each batch. A song that hangs
+    (a lyrics site or YouTube call that never answers) used to hold the batch,
+    and so the whole queue, forever. Now the batch is cut off, its songs fail
+    with a reason, and a fresh Downloader (new event loop, threads and yt-dlp)
+    carries on; the stuck one's loop is stopped and left behind."""
+
+    def __init__(self, make):
+        self.make = make
+        self.downloader = make()
+
+    def download_multiple_songs(self, songs):
+        if self.downloader is None:  # the last swap failed; try again now
+            self.downloader = self.make()
+        out, downloader = {}, self.downloader
+        loop = getattr(downloader, "loop", None)
+
+        def go():
+            # spotdl's loop belongs to the thread that made it; asyncio.gather
+            # needs it set as this thread's loop too
+            if loop is not None:
+                asyncio.set_event_loop(loop)
+            try:
+                out["results"] = downloader.download_multiple_songs(songs)
+            except BaseException as exc:  # handed back to the caller below
+                out["error"] = exc
+
+        batch = threading.Thread(target=go, daemon=True, name="download-batch")
+        batch.start()
+        batch.join(BATCH_LIMIT)
+        if batch.is_alive():
+            log.error("A batch of %d songs hung for %d min; starting a fresh downloader", len(songs), BATCH_LIMIT // 60)
+            if loop is not None:
+                loop.call_soon_threadsafe(loop.stop)  # ends the stuck run_until_complete
+            self.downloader = None
+            try:
+                self.downloader = self.make()
+            except Exception:  # retried on the next batch
+                log.exception("couldn't start a fresh downloader")
+            raise TimeoutError(f"took over {BATCH_LIMIT // 60} min")
+        if "error" in out:
+            raise out["error"]
+        return out["results"]
+
+
+def make_downloader():
+    downloader = Downloader(SETTINGS)
+    downloader.progress_handler.update_callback = on_progress
+    return downloader
+
+
 def worker():
     while True:  # if setup fails (no ffmpeg, no network...), say why and try again
         try:
             if SpotifyClient._instance is None:
                 SpotifyClient.init(client_id="", client_secret="", no_cache=True)
-            downloader = Downloader(SETTINGS)
+            downloader = Watched(make_downloader)
             break
         except Exception:
             log.exception("the downloader couldn't start; trying again in a minute")
             time.sleep(60)
-    downloader.progress_handler.update_callback = on_progress
     resolve = lambda urls: spotify(lambda: parse_query(urls, threads=SETTINGS["threads"]))  # noqa: E731
     log.info("Saving to %s as %s", Path.cwd(), SETTINGS["output"])
+    next_check = time.time() + UPDATE_HOURS * 3600
     while True:
-        serve_one(pending.get()[2], downloader, resolve)
+        if UPDATE_HOURS > 0 and time.time() >= next_check:
+            next_check = time.time() + UPDATE_HOURS * 3600
+            maybe_update()
+        if restart_wanted.is_set() and not others_busy():
+            restart()
+        try:
+            job = pending.get(timeout=60)[2]
+        except queue.Empty:
+            continue
+        serve_one(job, downloader, resolve)
+
+
+# --- Keep yt-dlp current ------------------------------------------------------
+# YouTube changes all the time, and a yt-dlp a few weeks old starts failing
+# downloads (or getting throttled until they time out). The image updates it at
+# start; the worker checks every UPDATE_HOURS between downloads (so no running
+# download sees a half-replaced yt-dlp) and restarts to load the new one.
+# Docker's restart policy brings the app back and the queue carries on.
+
+UPDATE_HOURS = float(os.environ.get("UPDATE_HOURS", "0"))  # the Docker image sets 24
+restart_wanted = threading.Event()
+others_busy = lambda: False  # noqa: E731  (an app embedding this one can say its own downloads are running)
+
+
+def update_ytdlp() -> bool:
+    """Install the newest yt-dlp; True when the version changed."""
+    before = version("yt-dlp")
+    cmd = [sys.executable, "-m", "pip", "install", "-q", "-U", "--no-cache-dir", "--disable-pip-version-check",
+           "--timeout", "15", "--retries", "2", "yt-dlp[default]"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode:
+        log.warning("couldn't update yt-dlp: %s", (r.stderr or r.stdout)[-300:])
+    after = version("yt-dlp")
+    if after != before:
+        log.info("yt-dlp updated from %s to %s", before, after)
+    return after != before
+
+
+def maybe_update():
+    """Called by the worker between downloads."""
+    try:
+        if update_ytdlp():
+            restart_wanted.set()
+    except Exception:
+        log.exception("yt-dlp update check failed")
+
+
+def restart():
+    log.info("Restarting to load the new yt-dlp")
+    os._exit(3)  # non-zero, so "on-failure" restart policies restart it too
 
 
 # --- Organize: move existing files to where OUTPUT says they belong ---------

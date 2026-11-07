@@ -878,7 +878,7 @@ function jobItem(j) {
   const sub = [kind, j.kind === "artist" ? "" : j.subtitle].filter(Boolean).join(", ");
   const songs = j.songs.length > 1 ? `<details data-job="${esc(j.job)}" ${expanded.has(j.job) ? "open" : ""}>
       <summary>${plural(j.songs.length, "song")}</summary>
-      <ol class="songs">${j.songs.map((s) => `<li class="${esc(s.status)}"><span>${esc(s.name)} <span class="sub">${esc(s.artists.join(", "))}</span></span><span class="st">${esc(s.status === "downloading" ? s.message || "Downloading" : SONG_LABEL[s.status] || s.status)}</span></li>`).join("")}</ol>
+      <ol class="songs">${j.songs.map((s) => `<li class="${esc(s.status)}"><span>${esc(s.name)} <span class="sub">${esc(s.artists.join(", "))}</span></span><span class="st" title="${esc(s.error || "")}">${esc(s.status === "downloading" ? s.message || "Downloading" : (s.status === "failed" && s.error) || SONG_LABEL[s.status] || s.status)}</span></li>`).join("")}</ol>
     </details>` : "";
   const failed = j.status === "failed" || (["done", "stopped"].includes(j.status) && j.failed);
   return `<li class="job ${esc(j.kind)}">

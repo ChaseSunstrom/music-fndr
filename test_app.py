@@ -58,6 +58,137 @@ def check_discographies_wait_their_turn():
         app.jobs.clear()
 
 
+def check_hung_batch_is_cut_off():
+    """A song that never finishes (a site that stops answering) used to hold its
+    batch, and the whole queue, forever. The batch is cut off, its songs fail
+    with a reason (no retry: it would hang again), the stuck loop is stopped,
+    and the next job runs on a fresh downloader."""
+    import asyncio
+
+    class FakeDownloader:  # like spotdl's: its own loop, made in the worker thread, used with gather
+        def __init__(self, hang):
+            self.loop, self.hang, self.calls = asyncio.new_event_loop(), hang, []
+
+        async def one(self, s):
+            if self.hang:
+                await asyncio.sleep(3600)
+            if s.url.endswith("2"):
+                app.on_progress(NS(song=s, progress=100, failure=LookupError("No results found for song: x")), "Error")
+                return s, None
+            return s, "ok.mp3"
+
+        def download_multiple_songs(self, batch):
+            self.calls.append([s.url for s in batch])
+            return list(self.loop.run_until_complete(asyncio.gather(*[self.one(s) for s in batch])))
+
+    made = []
+
+    def make():
+        made.append(FakeDownloader(hang=not made))  # the first one hangs
+        return made[-1]
+
+    real_limit, app.BATCH_LIMIT = app.BATCH_LIMIT, 0.5
+    watched = app.Watched(make)
+    raws = []
+    try:
+        for n, ids in enumerate([("h1", "h2"), ("n1", "n2")]):
+            job = client.post("/api/downloads", json={"kind": "album", "id": f"hang{n}"}).json()
+            raw = next(j for j in app.jobs if j["job"] == job["job"])
+            raws.append(raw)
+            started = time.time()
+            app.run(raw, watched, lambda urls, ids=ids: [song(ids[0], "One"), song(ids[1], "Two")])
+            assert time.time() - started < 5
+        hung, fine = raws
+        assert len(made) == 2 and made[0].calls == [["h1", "h2"]] and made[1].calls == [["n1", "n2"], ["n2"]], [m.calls for m in made]
+        assert hung["status"] == "done", hung
+        assert {s["status"] for s in hung["songs"].values()} == {"failed"}
+        assert {s["error"] for s in hung["songs"].values()} == {"Took too long and was cut off"}
+        time.sleep(0.2)
+        assert not made[0].loop.is_running(), "the stuck loop is stopped"
+        assert fine["songs"]["n1"]["status"] == "done" and "error" not in fine["songs"]["n1"]
+        assert fine["songs"]["n2"]["error"] == "Not found on YouTube Music", fine["songs"]["n2"]
+    finally:
+        app.BATCH_LIMIT = real_limit
+        with app.lock:
+            for raw in raws:
+                app.jobs.remove(raw)
+
+
+def check_youtube_rate_limit_pauses():
+    """Past ~300 songs an hour YouTube refuses this server "for up to an hour", and
+    every song after that failed. Now the download waits (15 min or more) and then
+    carries on with the refused songs; the ones already saved aren't fetched again."""
+    from spotdl.providers.audio.base import AudioProviderError
+
+    def refused():
+        try:
+            raise AudioProviderError("ERROR: [youtube] abcdefghijk: This content isn't available, try again later. "
+                                     "The current session has been rate-limited by YouTube for up to an hour.")
+        except AudioProviderError as inner:
+            try:
+                raise AudioProviderError("YT-DLP download error - https://x") from inner
+            except AudioProviderError as outer:
+                return outer
+
+    limited = [True]
+
+    def download_multiple_songs(batch):
+        out = []
+        for s in batch:
+            if limited[0] and s.url == "y2":
+                app.on_progress(NS(song=s, progress=0, failure=refused()), "Error")
+                out.append((s, None))
+            else:
+                out.append((s, "ok.mp3"))
+        return out
+
+    job = client.post("/api/downloads", json={"kind": "album", "id": "limited"}).json()
+    raw = next(j for j in app.jobs if j["job"] == job["job"])
+    tracks = [song("y1", "First"), song("y2", "Second"), song("y3", "Third")]
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        limited[0] = False  # the hour passes
+
+    try:
+        # one song per batch: the refused song's later batches must come back too
+        real_run = app.run
+        app.run = lambda job, d, r: real_run(job, d, r, batch=1)
+        try:
+            app.work(raw, NS(download_multiple_songs=download_multiple_songs), lambda urls: tracks, sleep=sleep)
+        finally:
+            app.run = real_run
+        assert waits == [15 * 60], waits
+        assert raw["status"] == "done" and {s["status"] for s in raw["songs"].values()} == {"done"}, raw
+        assert app.reason(refused()) == "YouTube is rate-limiting this server"
+        assert app.LIMITED.search("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+        assert app.LIMITED.search("HTTP Error 429: Too Many Requests")
+        assert "--sleep-requests" in app.SETTINGS["yt_dlp_args"]
+    finally:
+        with app.lock:
+            app.jobs.remove(raw)
+
+
+def check_ytdlp_auto_update():
+    """The worker updates yt-dlp between downloads and restarts to load it, but
+    not while another download (in an app embedding this one) is running."""
+    real = app.update_ytdlp, app.others_busy
+    try:
+        app.update_ytdlp = lambda: False
+        app.maybe_update()
+        assert not app.restart_wanted.is_set()
+        app.update_ytdlp = lambda: True
+        app.maybe_update()
+        assert app.restart_wanted.is_set()
+        app.update_ytdlp = lambda: 1 / 0
+        app.maybe_update()  # a failed check never stops the worker
+    finally:
+        app.update_ytdlp, app.others_busy = real
+        app.restart_wanted.clear()
+    assert "azlyrics" not in app.SETTINGS["lyrics_providers"]
+
+
 def check_links():
     for q, want in [
         ("https://open.spotify.com/album/6dVIqQ8qmQ5GBnJ9shOYGE?si=x", ("album", "6dVIqQ8qmQ5GBnJ9shOYGE")),
@@ -581,6 +712,9 @@ def check_home():
 if __name__ == "__main__":
     check_spotdl_loads_before_threads()
     check_worker_survives_a_crash()
+    check_hung_batch_is_cut_off()
+    check_youtube_rate_limit_pauses()
+    check_ytdlp_auto_update()
     check_discographies_wait_their_turn()
     check_links()
     check_cross_site_guard()

@@ -11,8 +11,10 @@ services:
       # - OUTPUT={album-artist}/{album}/{track-number} - {title}.{output-ext}
       # - THREADS=4       # songs downloaded at once
       # - SYNC_HOURS=24   # re-sync saved playlists; 0 = off
+      # - YT_DLP_ARGS=--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8   # pacing; empty = full speed
       # - JELLYFIN_URL=http://localhost:8096   # create playlists in Jellyfin
       # - JELLYFIN_API_KEY=                    # Dashboard > API Keys
     volumes:
       - ${MUSIC_DIR:-/data/music}:/music
+    init: true            # passes stop signals on while the start-up yt-dlp update runs
     restart: unless-stopped
