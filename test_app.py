@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 from fastapi.testclient import TestClient
 
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -192,23 +193,50 @@ def check_ytdlp_auto_update():
 def check_heal_when_youtube_changes():
     """A failure that means YouTube changed updates yt-dlp at once, nightly if stable has nothing
     newer, at most hourly; rate limits and removed videos don't."""
-    real = app.update_ytdlp, app.UPDATE_HOURS, app._healed
+    real = app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL
     tried = []
     try:
+        app.HEALED = Path(tempfile.mkdtemp()) / "healed"
         app.UPDATE_HOURS, app._healed = 24, 0.0
         app.update_ytdlp = lambda pre=False: tried.append(pre) or pre  # stable: nothing newer; nightly: newer
+        for why, broken in [("ERROR: [youtube] abc: Video unavailable. This video has been removed", False),
+                            ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", False),
+                            ("HTTP Error 429: Too Many Requests", False),
+                            ("Unable to extract player response; rate-limit reached", False),
+                            ("ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing", True),
+                            ("ERROR: [youtube] abc: Signature extraction failed: Some formats may be missing", True),
+                            ("ERROR: [youtube] abc: Requested format is not available", True),
+                            ("ERROR: [youtube] abc: Unable to extract yt initial data", True),
+                            ("ERROR: [youtube] abc: Failed to extract any player response", True),
+                            ("ERROR: [youtube] abc: No video formats found!", True)]:
+            assert app.looks_broken(why) is broken, why
         assert not app.heal("ERROR: [youtube] abc: Video unavailable. This video has been removed")
         assert not app.heal("HTTP Error 429: Too Many Requests")
         assert app.heal("ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing")
         assert tried == [False, True] and app.restart_wanted.is_set(), tried
         assert not app.heal("Requested format is not available"), "at most once an hour"
-        app._healed = time.time() - 3700
+        app._healed = 0.0  # a restart forgets; the file remembers
+        assert not app.heal("Requested format is not available"), "the cap survives a restart"
+        os.utime(app.HEALED, (time.time() - 3700,) * 2)
         assert app.heal("Requested format is not available")
-        app.UPDATE_HOURS = 0
+        app.HEAL, app._healed = False, 0.0
+        os.utime(app.HEALED, (0, 0))
+        assert not app.heal("nsig extraction failed") and not app.heal_soon("nsig extraction failed"), "HEAL=0 turns it off"
+        app.HEAL = True
+
+        def no_pip(pre=False):
+            tried.append("pip")
+            raise RuntimeError("Read-only file system")
+        app.update_ytdlp = no_pip
+        assert app.heal("nsig extraction failed") and not app.HEAL, "a pip that can't install stops healing"
+        os.utime(app.HEALED, (0, 0))
         app._healed = 0.0
+        assert not app.heal("nsig extraction failed") and tried.count("pip") == 1, "and doesn't try again"
+        app.HEAL = True
+        app.UPDATE_HOURS = 0
         assert not app.heal("nsig extraction failed"), "UPDATE_HOURS=0 turns it off"
     finally:
-        app.update_ytdlp, app.UPDATE_HOURS, app._healed = real
+        app.update_ytdlp, app.UPDATE_HOURS, app._healed, app.HEALED, app.HEAL = real
         app.restart_wanted.clear()
 
 

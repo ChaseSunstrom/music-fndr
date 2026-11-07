@@ -40,6 +40,7 @@ All optional. Set them under `environment:`.
 | `SYNC_HOURS` | `24` | How often saved playlists re-sync. `0` turns it off. |
 | `YT_DLP_ARGS` | `--sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8` | Extra [yt-dlp options](https://github.com/yt-dlp/yt-dlp#usage-and-options) for every download. The default paces requests to YouTube; set it empty to go full speed. |
 | `UPDATE_HOURS` | `24` | How often yt-dlp is updated while running (it's also updated on every start). `0` turns both off, for a yt-dlp you manage yourself. |
+| `HEAL` | `1` | When downloads fail in a way that means YouTube changed something, update yt-dlp straight away (at most hourly). `0` leaves it to the start-up and `UPDATE_HOURS` updates. |
 | `JELLYFIN_URL` | | For example `http://192.168.1.10:8096`. With `JELLYFIN_API_KEY`, playlists are created in Jellyfin directly. |
 | `JELLYFIN_API_KEY` | | Jellyfin → Dashboard → API Keys → + |
 | `JELLYFIN_USER` | first admin | Whose account the playlists belong to |
@@ -75,7 +76,7 @@ Spotify lookups use the same anonymous access as the Spotify web player, so ther
 
 ## Updating
 
-YouTube changes often, and a yt-dlp a few weeks old starts failing downloads. The container updates yt-dlp every time it starts and checks again every `UPDATE_HOURS`; when there's a new one it restarts between downloads to load it (the queue carries on). When downloads fail in a way that means YouTube changed something, it updates straight away (at most once an hour), to yt-dlp's nightly build if the regular release has no fix yet. To update everything else, rebuild:
+YouTube changes often, and a yt-dlp a few weeks old starts failing downloads. The container updates yt-dlp every time it starts and checks again every `UPDATE_HOURS`; when there's a new one it restarts between downloads to load it (the queue carries on). When downloads fail in a way that means YouTube changed something, it updates straight away (at most once an hour), to yt-dlp's nightly build if the regular release has no fix yet, and goes back to the regular release once a newer one is out (`HEAL=0` turns this off; if yt-dlp can't be installed there, it says so once in the log and stops trying). To update everything else, rebuild:
 
 ```sh
 docker compose build --pull --no-cache && docker compose up -d
