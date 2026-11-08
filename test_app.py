@@ -68,7 +68,7 @@ def check_hung_batch_is_cut_off():
 
     class FakeDownloader:  # like spotdl's: its own loop, made in the worker thread, used with gather
         def __init__(self, hang):
-            self.loop, self.hang, self.calls = asyncio.new_event_loop(), hang, []
+            self.loop, self.hang, self.calls, self.settings = asyncio.new_event_loop(), hang, [], {}
 
         async def one(self, s):
             if self.hang:
@@ -836,6 +836,36 @@ def check_home():
     assert len(h["chart"]) == 10 and h["new"] and len(h["playlists"]) >= 6, {k: len(v) for k, v in h.items()}
 
 
+def check_job_output_folder():
+    """An app embedding this one (Parlor) can send one job's songs somewhere else, like a staging folder another app
+    imports from: the job's own output template is used for its songs and their paths, and the next job is back to
+    the usual one. The HTTP API can't set it."""
+    out = "/staging/req-7/{album-artist}/{album}/{track-number} - {title}.{output-ext}"
+    seen = []
+
+    class Inner:
+        settings = {"output": app.SETTINGS["output"]}
+
+        def download_multiple_songs(self, batch):
+            seen.append(self.settings["output"])
+            return [(s, "x.mp3") for s in batch]
+
+    watched = app.Watched(Inner)
+    staged = app.queue_download("album", "staged1", output=out)
+    plain = app.queue_download("album", "plain1")
+    for view, ids in ((staged, ("s1", "s2")), (plain, ("p1",))):
+        raw = next(j for j in app.jobs if j["job"] == view["job"])
+        with app.lock:
+            raw["status"] = "queued"
+        watched.output = raw.get("output")
+        app.run(raw, watched, lambda urls, ids=ids: [song(i, f"Song {i}") for i in ids])
+    assert seen == [out, app.SETTINGS["output"]], seen
+    staged_raw = next(j for j in app.jobs if j["job"] == staged["job"])
+    assert staged_raw["output"] == out and "output" not in next(j for j in app.jobs if j["job"] == plain["job"])
+    r = client.post("/api/downloads", json={"kind": "album", "id": "x1", "output": "/etc/{title}.{output-ext}"}).json()
+    assert "output" not in next(j for j in app.jobs if j["job"] == r["job"]), "the API can't choose where files go"
+
+
 if __name__ == "__main__":
     check_spotdl_loads_before_threads()
     check_worker_survives_a_crash()
@@ -857,4 +887,5 @@ if __name__ == "__main__":
     check_reconnect()
     check_home()
     check_library_artist()
+    check_job_output_folder()
     print("ok")

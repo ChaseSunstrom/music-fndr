@@ -484,7 +484,9 @@ def enqueue(req: DownloadRequest):
     return queue_download(**req.model_dump())
 
 
-def queue_download(kind, id, title=None, subtitle=None, image=None):
+def queue_download(kind, id, title=None, subtitle=None, image=None, output=None):
+    """Queue a download. `output` (for an app embedding this one, never from the API) is an output template for this
+    job only, like a staging folder another app imports from."""
     if kind not in ("track", "album", "artist", "playlist"):
         raise HTTPException(422, "kind must be track, album, artist or playlist")
     if not re.fullmatch(r"[A-Za-z0-9]+", id):
@@ -505,6 +507,7 @@ def queue_download(kind, id, title=None, subtitle=None, image=None):
         "current": 0,
         "stop": False,
         "songs": {},
+        **({"output": output} if output else {}),
     }
     with lock:
         jobs.insert(0, job)
@@ -606,10 +609,10 @@ def reason(exc) -> str:
     return f"{type(exc).__name__}: {text}"[:160]
 
 
-def target(song):
+def target(song, output=None):
     """Where spotdl will write a song, so a restart can clean up after it."""
     try:
-        return str(create_file_name(song, SETTINGS["output"], SETTINGS["format"]))
+        return str(create_file_name(song, output or SETTINGS["output"], SETTINGS["format"]))
     except Exception:
         return None
 
@@ -719,7 +722,7 @@ def run(job, downloader, resolve, batch=None):
                     "status": "duplicate" if s.url in repeats else "skipped" if s.url in mine else "queued",
                     "progress": 0,
                     "message": "Using the copy you have" if s.url in mine else "",
-                    "path": mine.get(s.url) or target(s),
+                    "path": mine.get(s.url) or target(s, job.get("output")),
                     "pos": getattr(s, "list_position", None),  # order within a playlist
                     "secs": getattr(s, "duration", None),
                 }
@@ -812,6 +815,8 @@ def work(job, downloader, resolve, sleep=None):
 def serve_one(job, downloader, resolve):
     """Run one job; whatever goes wrong, the worker carries on with the next."""
     try:
+        if downloader is not None:
+            downloader.output = job.get("output")  # this job's own folder, if it has one
         work(job, downloader, resolve)
     except Exception as exc:
         log.exception("download %s crashed", job.get("job"))
@@ -832,11 +837,13 @@ class Watched:
     def __init__(self, make):
         self.make = make
         self.downloader = make()
+        self.output = None  # the running job's output template; None is the usual one
 
     def download_multiple_songs(self, songs):
         if self.downloader is None:  # the last swap failed; try again now
             self.downloader = self.make()
         out, downloader = {}, self.downloader
+        downloader.settings["output"] = self.output or SETTINGS["output"]  # a fresh downloader gets it too
         loop = getattr(downloader, "loop", None)
 
         def go():
