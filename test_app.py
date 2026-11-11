@@ -866,6 +866,101 @@ def check_job_output_folder():
     assert "output" not in next(j for j in app.jobs if j["job"] == r["job"]), "the API can't choose where files go"
 
 
+def check_quality():
+    """New downloads are saved in the chosen quality: YouTube's audio as it is (AAC in .m4a or Opus in .opus, no
+    re-encode) or mp3 at 320k or 128k. The choice is made while the app runs, the next batch uses it, and it's kept
+    across restarts. A new install gets the source audio; one with songs or with FORMAT/BITRATE set keeps what it had.
+    A song already in the library in another format still counts as there."""
+    app.QUALITY_FILE = app.STATE.parent / "quality"
+    was = (app.SETTINGS["format"], app.SETTINGS["bitrate"])
+    try:
+        app.SETTINGS.update(format="mp3", bitrate="128k")
+        got = client.get("/api/quality").json()
+        assert got["quality"] == "mp3-128" and [c["id"] for c in got["choices"]] == ["m4a", "opus", "mp3-320", "mp3-128"], got
+        assert client.put("/api/quality", json={"quality": "flac"}).status_code == 422
+        assert client.put("/api/quality", json={"quality": "m4a"}).json()["quality"] == "m4a"
+        assert (app.SETTINGS["format"], app.SETTINGS["bitrate"]) == ("m4a", "disable"), "spotdl moves the .m4a it fetched: no re-encode"
+        assert app.QUALITY_FILE.read_text().strip() == "m4a"
+        # a downloader made for the old quality is replaced before the next batch, once
+        made = []
+
+        class Inner:
+            def __init__(self):
+                self.settings = {"output": ""}
+                made.append((app.SETTINGS["format"], app.SETTINGS["bitrate"]))
+
+            def download_multiple_songs(self, batch):
+                return [(s, "x") for s in batch]
+
+        watched = app.Watched(Inner)
+        watched.download_multiple_songs([1])
+        app.set_quality("opus")
+        watched.download_multiple_songs([1])
+        watched.download_multiple_songs([1])
+        assert made == [("m4a", "disable"), ("opus", "disable")], made
+        # the mp3 you have counts as there, whatever new downloads are saved as
+        assert app.copy_we_have(song("https://open.spotify.com/track/abc", "S"), {"abc": "A/B/01 - S.mp3"}, {}) == "A/B/01 - S.mp3"
+        # an album too: the song saved as .mp3 before isn't fetched again as .opus, and a fetched one records where it went
+        have, new_one = (app.SpotdlSong.from_missing_data(name=n, artists=["A"], artist="A", album_name="Q", album_artist="A", track_number=i, duration=200,
+                                                          url=f"https://open.spotify.com/track/qh{i}") for i, n in ((1, "Had"), (2, "New")))
+        old_copy = Path(app.target(have)).with_suffix(".mp3")
+        old_copy.parent.mkdir(parents=True, exist_ok=True)
+        old_copy.write_bytes(b"x")
+        asked = []
+
+        def download(batch):
+            asked.extend(s.url for s in batch)
+            return [(s, Path("elsewhere") / "New.opus") for s in batch]
+
+        album = client.post("/api/downloads", json={"kind": "album", "id": "qual"}).json()
+        raw = next(j for j in app.jobs if j["job"] == album["job"])
+        try:
+            app.run(raw, NS(download_multiple_songs=download), lambda urls: [have, new_one])
+            assert asked == [new_one.url], asked
+            assert (raw["songs"][have.url]["status"], raw["songs"][have.url]["path"]) == ("skipped", str(old_copy)), raw["songs"][have.url]
+            assert (raw["songs"][new_one.url]["status"], raw["songs"][new_one.url]["path"]) == ("done", "elsewhere/New.opus"), raw["songs"][new_one.url]
+        finally:
+            old_copy.unlink()
+            client.delete(f"/api/downloads/{album['job']}")
+        # a folder that can't be written to doesn't stop the choice (or the start): it holds until the next start
+        file, app.QUALITY_FILE = app.QUALITY_FILE, old_copy.parent / "no" / "such" / "quality"
+        try:
+            app.set_quality("opus")
+            assert app.quality() == "opus"
+        finally:
+            app.QUALITY_FILE = file
+        # a restart keeps the choice, whatever the environment says
+        app.SETTINGS.update(format="mp3", bitrate="128k")
+        app.load_quality({"FORMAT": "mp3", "QUALITY": "mp3-320"})
+        assert app.quality() == "opus"
+        # nothing saved: QUALITY, then FORMAT/BITRATE as they are (any spotdl format: "custom" here)
+        app.QUALITY_FILE.unlink()
+        app.load_quality({"QUALITY": "mp3-320"})
+        assert app.quality() == "mp3-320" and not app.QUALITY_FILE.exists()
+        app.SETTINGS.update(format="flac", bitrate="auto")
+        app.load_quality({"FORMAT": "flac"})
+        assert app.quality() == "custom" and app.SETTINGS["format"] == "flac"
+        assert client.get("/api/quality").json()["quality"] == "custom"
+        # an install that has downloaded before keeps mp3 128k until someone chooses
+        app.save()
+        app.SETTINGS.update(format="mp3", bitrate="128k")
+        app.load_quality({})
+        assert app.quality() == "mp3-128" and not app.QUALITY_FILE.exists()
+        # a new install (no queue file yet) gets the source audio, and keeps it once the queue file exists
+        state, app.STATE = app.STATE, app.STATE.parent / "not-yet.json"
+        try:
+            app.load_quality({})
+            assert app.quality() == "m4a" and app.QUALITY_FILE.read_text().strip() == "m4a"
+        finally:
+            app.STATE = state
+        app.SETTINGS.update(format="mp3", bitrate="128k")
+        app.load_quality({})
+        assert app.quality() == "m4a"
+    finally:
+        app.SETTINGS["format"], app.SETTINGS["bitrate"] = was
+        app.QUALITY_FILE.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     check_spotdl_loads_before_threads()
     check_worker_survives_a_crash()
@@ -888,4 +983,5 @@ if __name__ == "__main__":
     check_home()
     check_library_artist()
     check_job_output_folder()
+    check_quality()
     print("ok")

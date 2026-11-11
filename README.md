@@ -33,8 +33,8 @@ All optional. Set them under `environment:`.
 | Variable  | Default | What it does |
 |-----------|---------|--------------|
 | `OUTPUT`  | `{album-artist}/{album}/{track-number} - {title}.{output-ext}` | Where each file goes inside `/music`. Uses [spotDL's template variables](https://spotdl.readthedocs.io/en/latest/usage/#output). For spotDL's flat layout, use `{artists} - {title}.{output-ext}`. |
-| `FORMAT`  | `mp3` | `mp3`, `flac`, `ogg`, `opus`, `m4a` or `wav` |
-| `BITRATE` | `128k` | For example `320k`, or `disable` to keep the source quality |
+| `QUALITY` | see below | `m4a`, `opus`, `mp3-320` or `mp3-128`: what new downloads are saved as, until you choose in the app |
+| `FORMAT`, `BITRATE` | none | spotDL's own format (`mp3`, `flac`, `ogg`, `opus`, `m4a`, `wav`) and bitrate (`320k`, or `disable` to keep the source's), for anything `QUALITY` doesn't cover |
 | `THREADS` | `4` | How many songs download at the same time |
 | `PORT`    | `8800` | The port the web UI listens on |
 | `SYNC_HOURS` | `24` | How often saved playlists re-sync. `0` turns it off. |
@@ -59,6 +59,12 @@ All optional. Set them under `environment:`.
 
 **Library** shows what's in your music folder by artist and album, read from the files' tags. Spotify pages mark songs you already have.
 
+- **Quality.** The Downloads panel has **New downloads are saved as**:
+  - *Source audio, AAC (.m4a)*: the source audio from YouTube as it is, with no re-encoding, so nothing is lost. Plays everywhere. A new install starts here.
+  - *Source audio, Opus (.opus)*: YouTube's highest-quality stream as it is. Older iPhones and some car stereos can't play Opus.
+  - *MP3, 320 kbps* and *MP3, 128 kbps*: re-encoded from the source. 320 makes bigger files but can't be better than the source; 128 is what installs from before this choice keep until you change it.
+
+  The choice applies from the next songs on and survives restarts. Songs you already have are recognised in any format (a playlist's by their tags, an album's by their file names), so changing it never fetches them again (and it doesn't convert them either: converting one lossy format to another only loses quality).
 - **Organize your music folder** moves existing files into the `OUTPUT` layout (Artist/Album folders by default) using their tags. It shows every move before doing anything, and **Move** applies exactly that preview. It never overwrites or deletes your files: files with missing tags, and files that would land on an existing file, stay where they are. Folders left empty are removed. Keep `FORMAT` the same as your existing files (spotDL's default is mp3) so they're recognised. Run this once if you're coming from spotDL's flat layout; otherwise songs you already have won't be recognised.
 - **Get missing songs**, on each artist or on every artist at once, finds the artist on Spotify and queues their discography. Songs you have come back as "Already there", so a finished download tells you what was missing.
 

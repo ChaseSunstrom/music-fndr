@@ -389,6 +389,76 @@ FINISHED = ("done", "skipped", "duplicate", "failed")
 library = threading.Lock()  # a download and an organize never touch /music at once
 
 
+# --- Quality ----------------------------------------------------------------------
+# What new downloads are saved as. YouTube has each song as AAC (.m4a) and as Opus; the first two choices keep that
+# audio as it is (spotdl moves the .m4a, or copies the Opus stream out of its .webm: no re-encode, so nothing is lost
+# and nothing is padded). The mp3 choices re-encode. Songs already in the library count as there in any format
+# (they're found by their tags), so changing this fetches nothing again.
+
+QUALITIES = {  # id -> (spotdl's format, its bitrate; "disable" keeps the source's)
+    "m4a": ("m4a", "disable"),
+    "opus": ("opus", "disable"),
+    "mp3-320": ("mp3", "320k"),
+    "mp3-128": ("mp3", "128k"),
+}
+QUALITY_LABELS = {
+    "m4a": "Source audio, AAC (.m4a): YouTube's audio as it is; plays everywhere",
+    "opus": "Source audio, Opus (.opus): YouTube's highest quality as it is; older iPhones can't play it",
+    "mp3-320": "MP3, 320 kbps: re-encoded, bigger files, no better than the source",
+    "mp3-128": "MP3, 128 kbps: re-encoded, small files",
+}
+QUALITY_FILE = Path(".music-findr/quality")  # the choice made while running; it wins over the environment
+
+
+def quality() -> str:
+    now = (SETTINGS["format"], SETTINGS["bitrate"])
+    return next((name for name, pair in QUALITIES.items() if pair == now), "custom")
+
+
+def set_quality(name: str, keep=True):
+    """Use this quality from the next batch of songs on (the worker makes a fresh downloader for it)."""
+    SETTINGS["format"], SETTINGS["bitrate"] = QUALITIES[name]
+    if keep:
+        try:
+            QUALITY_FILE.parent.mkdir(exist_ok=True)
+            QUALITY_FILE.write_text(name + "\n")
+        except OSError as exc:  # a folder it can't write to: the choice holds until the next start
+            log.warning("couldn't save the quality choice: %s", exc)
+
+
+def load_quality(env=os.environ):
+    """At start: the saved choice; else QUALITY; else FORMAT and BITRATE as given; else, for an install that has
+    never downloaded anything, the source audio (kept, so it stays that way); else what it always was, mp3 128k."""
+    try:
+        saved = QUALITY_FILE.read_text().strip()
+    except OSError:
+        saved = ""
+    if saved in QUALITIES:
+        set_quality(saved, keep=False)
+    elif env.get("QUALITY") in QUALITIES:
+        set_quality(env["QUALITY"], keep=False)
+    elif not (env.get("FORMAT") or env.get("BITRATE")) and not STATE.exists():
+        set_quality("m4a")
+
+
+class QualityRequest(BaseModel):
+    quality: str
+
+
+@app.get("/api/quality")
+def get_quality():
+    return {"quality": quality(), "choices": [{"id": name, "label": QUALITY_LABELS[name]} for name in QUALITIES]}
+
+
+@app.put("/api/quality")
+def put_quality(body: QualityRequest):
+    if body.quality not in QUALITIES:
+        raise HTTPException(422, f"quality is one of {', '.join(QUALITIES)}")
+    set_quality(body.quality)
+    log.info("New downloads are saved as %s", body.quality)
+    return get_quality()
+
+
 class DownloadRequest(BaseModel):
     kind: str
     id: str
@@ -650,6 +720,14 @@ def copy_we_have(song, by_id, by_name):
     return next((path for secs, path in by_name.get(key, []) if abs(secs - song.duration) <= 20), None)
 
 
+def other_format(path):
+    """the file a song would be saved as, there already in another format (spotdl itself only looks for its own)"""
+    if not path:
+        return None
+    p = Path(path)
+    return next((str(q) for ext in sorted(AUDIO) if ext != p.suffix.lower() and (q := p.with_suffix(ext)).exists()), None)
+
+
 def run(job, downloader, resolve, batch=None):
     """Resolve and download a job one release at a time, in small batches,
     so songs arrive (and show up) early and a stop request lands quickly."""
@@ -687,6 +765,8 @@ def run(job, downloader, resolve, batch=None):
             entry = job["songs"][song.url]
             if entry["status"] not in ("done", "skipped"):
                 entry["status"] = "done" if path else "failed"
+                if path:
+                    entry["path"] = str(path)  # where it really went: the quality may have changed since it was queued
             if entry["status"] in ("done", "skipped"):
                 entry.pop("error", None)  # the retry worked
 
@@ -714,7 +794,9 @@ def run(job, downloader, resolve, batch=None):
             if job["kind"] == "playlist":
                 index = library_songs()
                 mine = {s.url: p for s in songs if (p := copy_we_have(s, *index))}
-                songs = [s for s in songs if s.url not in mine]
+            else:  # the same release, saved in another format before the quality was changed
+                mine = {s.url: p for s in songs if (p := other_format(target(s, job.get("output"))))}
+            songs = [s for s in songs if s.url not in mine]
             new = {
                 s.url: {
                     "name": s.name,
@@ -837,11 +919,13 @@ class Watched:
     def __init__(self, make):
         self.make = make
         self.downloader = make()
+        self.made_as = (SETTINGS["format"], SETTINGS["bitrate"])
         self.output = None  # the running job's output template; None is the usual one
 
     def download_multiple_songs(self, songs):
-        if self.downloader is None:  # the last swap failed; try again now
-            self.downloader = self.make()
+        now = (SETTINGS["format"], SETTINGS["bitrate"])
+        if self.downloader is None or self.made_as != now:  # the last swap failed, or the quality was changed
+            self.downloader, self.made_as = self.make(), now
         out, downloader = {}, self.downloader
         downloader.settings["output"] = self.output or SETTINGS["output"]  # a fresh downloader gets it too
         loop = getattr(downloader, "loop", None)
@@ -1497,6 +1581,7 @@ def import_links(req: ImportRequest):
 
 @app.on_event("startup")
 def start_worker():
+    load_quality()  # before the queue file is touched: its absence is how a new install is told apart
     restore()
     load_saved()
     threading.Thread(target=worker, daemon=True, name="downloader").start()

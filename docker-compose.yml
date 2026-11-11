@@ -6,6 +6,7 @@ services:
     network_mode: host
     environment:
       - PORT=8800
+      # - QUALITY=m4a     # m4a or opus (the source audio as it is), mp3-320 or mp3-128; the app can change it
       # - FORMAT=mp3      # mp3, flac, ogg, opus, m4a or wav
       # - BITRATE=128k    # e.g. 320k, or "disable" to keep the source quality
       # - OUTPUT={album-artist}/{album}/{track-number} - {title}.{output-ext}

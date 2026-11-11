@@ -222,6 +222,9 @@ a.ghost { display: inline-flex; align-items: center; }
   translate: 100% 0; visibility: hidden; transition: translate .22s ease, visibility 0s .22s;
 }
 .queue.open { translate: 0 0; visibility: visible; transition: translate .22s ease; }
+.quality { display: grid; gap: 6px; padding: 12px 22px 4px; font-weight: 600; font-size: .92rem; }
+.quality select { height: 40px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--sunk); color: var(--text); font: inherit; }
+.quality small { color: var(--dim); font-weight: 400; }
 .queue-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 16px 16px 12px 22px; border-bottom: 1px solid var(--line); }
 .queue-head h2 { margin: 0 auto 0 0; font-size: 1.3rem; }
 .icon-btn { width: 40px; height: 40px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: var(--dim); }
@@ -301,6 +304,8 @@ a.ghost { display: inline-flex; align-items: center; }
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
   </div>
+  <label class="quality">New downloads are saved as <select id="quality" aria-describedby="qualityNote"></select>
+    <small id="qualityNote">Songs you already have are never fetched again.</small></label>
   <ul class="jobs" id="jobs"></ul>
 </aside>
 
@@ -335,6 +340,18 @@ async function api(path, options = {}) {
   if (!res.ok) throw new Error(body.detail || `${res.status} ${res.statusText}`);
   return body;
 }
+
+/* ---------- the quality of new downloads ---------- */
+
+const qualityBox = document.getElementById("quality");
+api("/api/quality").then((q) => {
+  qualityBox.innerHTML = (q.quality === "custom" ? '<option value="custom" disabled>As set by FORMAT and BITRATE</option>' : "")
+    + q.choices.map((c) => `<option value="${c.id}">${c.label.split(":")[0]}</option>`).join("");
+  qualityBox.value = q.quality;
+  qualityBox.title = q.choices.map((c) => c.label).join("\n");
+}, () => { qualityBox.closest("label").hidden = true; });
+qualityBox.addEventListener("change", () => api("/api/quality", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ quality: qualityBox.value }) })
+  .then(() => toast("Saved. New downloads use it; nothing you have is fetched again."), (e) => toast(e.message)));
 
 /* ---------- building blocks ---------- */
 
